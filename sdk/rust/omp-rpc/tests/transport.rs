@@ -910,6 +910,7 @@ fn big_ui_response() -> RpcInbound {
 	RpcInbound::ExtensionUiResponse(ExtensionUiResponse::ValueUiResponse(ValueUiResponse {
 		id:    "ui".to_owned(),
 		value: "v".repeat(BIG),
+		response_id: None,
 	}))
 }
 

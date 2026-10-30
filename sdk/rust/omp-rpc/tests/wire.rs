@@ -185,10 +185,23 @@ fn inbound_frames_carry_constants() {
 			id:        "ui_1".into(),
 			cancelled: LitTrue,
 			timed_out: None,
+			response_id: None,
 		}));
 	let encoded = serde_json::to_value(&cancel).unwrap();
 	assert_eq!(encoded, json!({"type": "extension_ui_response", "id": "ui_1", "cancelled": true}));
 	assert_eq!(serde_json::from_value::<RpcInbound>(encoded).unwrap(), cancel);
+}
+
+#[test]
+fn correlated_ui_replies_keep_question_and_delivery_id_distinct() {
+	let raw = json!({"type":"extension_ui_response","id":"question","responseId":"delivery","value":"answer"});
+	let decoded: RpcInbound = serde_json::from_value(raw.clone()).unwrap();
+	assert_eq!(serde_json::to_value(&decoded).unwrap(), raw);
+	let RpcInbound::ExtensionUiResponse(ExtensionUiResponse::ValueUiResponse(value)) = decoded else {
+		panic!("not a value reply");
+	};
+	assert_eq!(value.id, "question");
+	assert_eq!(value.response_id.as_deref(), Some("delivery"));
 }
 
 #[test]

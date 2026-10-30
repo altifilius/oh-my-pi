@@ -4639,6 +4639,8 @@ pub struct AskAnswer {
 pub struct ValueUiResponse {
 	pub id: String,
 	pub value: String,
+	#[serde(rename = "responseId", default, skip_serializing_if = "Option::is_none")]
+	pub response_id: Option<String>,
 }
 
 /// Answers a `confirm` request.
@@ -4646,6 +4648,8 @@ pub struct ValueUiResponse {
 pub struct ConfirmUiResponse {
 	pub id: String,
 	pub confirmed: bool,
+	#[serde(rename = "responseId", default, skip_serializing_if = "Option::is_none")]
+	pub response_id: Option<String>,
 }
 
 /// Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` then takes its recommended answers).
@@ -4653,6 +4657,8 @@ pub struct ConfirmUiResponse {
 pub struct CancelUiResponse {
 	pub id: String,
 	pub cancelled: LitTrue,
+	#[serde(rename = "responseId", default, skip_serializing_if = "Option::is_none")]
+	pub response_id: Option<String>,
 	#[serde(rename = "timedOut", default, skip_serializing_if = "Option::is_none")]
 	pub timed_out: Option<bool>,
 }
@@ -4662,9 +4668,11 @@ pub struct CancelUiResponse {
 pub struct AnswersUiResponse {
 	pub id: String,
 	pub answers: Vec<AskAnswer>,
+	#[serde(rename = "responseId", default, skip_serializing_if = "Option::is_none")]
+	pub response_id: Option<String>,
 }
 
-/// Host reply to an extension UI request; variants share `type` and differ by their payload key.
+/// Host reply to an extension UI request. Optional responseId requests a delivery response correlated by that id; id still targets the original question.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtensionUiResponse {
 	/// Answers a `select`, `input`, or `editor` request.
@@ -4860,7 +4868,7 @@ impl<'de> Deserialize<'de> for RpcHostRequest {
 /// Non-command frame the host sends, discriminated by `type`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RpcInbound {
-	/// Host reply to an extension UI request; variants share `type` and differ by their payload key.
+	/// Host reply to an extension UI request. Optional responseId requests a delivery response correlated by that id; id still targets the original question.
 	ExtensionUiResponse(ExtensionUiResponse),
 	/// Streams partial output of a pending host tool call.
 	HostToolUpdate(HostToolUpdate),

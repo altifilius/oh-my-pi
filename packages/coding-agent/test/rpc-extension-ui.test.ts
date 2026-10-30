@@ -263,6 +263,60 @@ await runRpcMode(session);
 		expect(seen).toContain("askDialog:function");
 	}, 30_000);
 
+	it("acknowledges startup dialog delivery and rejects a second answer before queued commands run", async () => {
+		await using temp = await TempDir.create("@rpc-startup-dialog-receipt-");
+		const child = await spawnStartupDialogRuntime(temp);
+		const stderr = new Response(child.stderr).text();
+		const receipts: object[] = [];
+		let startupResult: unknown;
+		let barrier = false;
+		try {
+			for await (const frame of readJsonl<unknown>(child.stdout)) {
+				if (!isRecord(frame)) continue;
+				if (frame.type === "extension_ui_request" && frame.method === "confirm") {
+					child.stdin.write(
+						`${JSON.stringify({ type: "extension_ui_response", id: frame.id, responseId: "accepted", confirmed: true })}\n`,
+					);
+					child.stdin.write(
+						`${JSON.stringify({ type: "extension_ui_response", id: frame.id, responseId: "duplicate", confirmed: false })}\n`,
+					);
+					child.stdin.write(`${JSON.stringify({ type: "get_state", id: "barrier" })}\n`);
+					await child.stdin.flush();
+				} else if (frame.type === "extension_ui_request" && frame.method === "notify") {
+					startupResult = frame.message;
+				} else if (frame.type === "response" && frame.command === "extension_ui_response") {
+					receipts.push(frame);
+				} else if (frame.type === "response" && frame.id === "barrier") {
+					barrier = frame.success === true;
+					child.stdin.end();
+				}
+			}
+		} finally {
+			child.stdin.end();
+			if (child.exitCode === null) child.kill();
+			await child.exited;
+		}
+		expect(receipts, await stderr).toEqual([
+			{
+				type: "response",
+				id: "accepted",
+				command: "extension_ui_response",
+				success: true,
+				data: { delivered: true },
+			},
+			{
+				type: "response",
+				id: "duplicate",
+				command: "extension_ui_response",
+				success: false,
+				error: "Question is no longer pending",
+				code: "stale_interaction",
+			},
+		]);
+		expect(startupResult).toBe("true");
+		expect(barrier).toBe(true);
+	}, 30_000);
+
 	it("rejects a dialog session_start awaits when stdin closes, so the process still exits", async () => {
 		await using temp = await TempDir.create("@rpc-startup-dialog-eof-");
 		const child = await spawnStartupDialogRuntime(temp);

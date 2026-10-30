@@ -667,6 +667,15 @@ export type RpcResponse =
 			data: { records: readonly RpcBtwHistoryRecord[] };
 	  }
 
+	// Optional delivery acknowledgement for an extension UI response, correlated by responseId.
+	| {
+			id: string;
+			type: "response";
+			command: "extension_ui_response";
+			success: true;
+			data: { delivered: true };
+	  }
+
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
 	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
 
@@ -966,7 +975,7 @@ export interface RpcHostUriResult {
 // ============================================================================
 
 /** Response to an extension UI request */
-export type RpcExtensionUIResponse =
+export type RpcExtensionUIResponse = { responseId?: string } & (
 	| { type: "extension_ui_response"; id: string; value: string }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
 	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean }
@@ -975,7 +984,8 @@ export type RpcExtensionUIResponse =
 			type: "extension_ui_response";
 			id: string;
 			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
-	  };
+	  }
+);
 
 // ============================================================================
 // Helper type for extracting command types

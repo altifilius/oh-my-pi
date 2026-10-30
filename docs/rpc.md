@@ -1350,6 +1350,10 @@ Example:
 - `{ type: "extension_ui_response", id: string, cancelled: true, timedOut?: boolean }`
 - `{ type: "extension_ui_response", id: string, answers: Array<{ id: string, selectedOptions: string[], customInput?: string }> }` (answers an `ask` request)
 
+All variants accept optional `responseId?: string`, a nonempty host-generated id distinct from the original question's `id`. Without it, replies retain the fire-and-forget behavior. With it, the side channel emits a `response` correlated by `id: responseId`, with `command: "extension_ui_response"`. A reply routed to a still-pending callback returns `{success:true,data:{delivered:true}}`; a missing, already-settled, aborted or expired question returns `{success:false,code:"stale_interaction",error:"Question is no longer pending"}`. Malformed correlation ids do not consume the question and receive the existing parse failure.
+
+This is a delivery receipt, not approval-policy or answer-schema validation: the pending callback still validates the answer, and an invalid `ask` payload may fail its tool call after delivery. The receipt does not echo answer text. These replies continue to bypass the serialized command queue, including during extension startup, so receipt emission does not wait for a model turn. If the transport closes before the receipt arrives, treat delivery as unknown rather than resubmitting the answer blindly.
+
 `select` and `input` resolve to `undefined`, and `confirm` to `false`, on
 cancellation, timeout, or signal abort. Signal abort emits a `cancel` request
 with `targetId`. `editor` supports cancellation and signal abort but has no wire timeout.

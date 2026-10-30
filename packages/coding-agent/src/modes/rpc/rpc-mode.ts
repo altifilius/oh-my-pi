@@ -395,11 +395,45 @@ function isRpcExtensionUIResponse(value: unknown): value is RpcExtensionUIRespon
 	return value.type === "extension_ui_response" && typeof value.id === "string";
 }
 
+function dispatchExtensionUIResponse(
+	response: RpcExtensionUIResponse,
+	pendingRequests: Map<string, PendingExtensionRequest>,
+	output: RpcOutput,
+): void {
+	if (
+		response.responseId !== undefined &&
+		(typeof response.responseId !== "string" || response.responseId.length === 0)
+	) {
+		throw new Error("Extension UI responseId must be a nonempty string");
+	}
+	const pending = pendingRequests.get(response.id);
+	if (pending) pending.resolve(response);
+	if (response.responseId !== undefined) {
+		output(
+			pending
+				? {
+						type: "response",
+						id: response.responseId,
+						command: "extension_ui_response",
+						success: true,
+						data: { delivered: true },
+					}
+				: {
+						type: "response",
+						id: response.responseId,
+						command: "extension_ui_response",
+						success: false,
+						error: "Question is no longer pending",
+						code: "stale_interaction",
+					},
+		);
+	}
+}
+
 /** Dispatch side-channel frames that must overtake the serialized command queue. */
 export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps): boolean {
 	if (isRpcExtensionUIResponse(parsed)) {
-		const pending = deps.pendingExtensionRequests.get(parsed.id);
-		if (pending) pending.resolve(parsed);
+		dispatchExtensionUIResponse(parsed, deps.pendingExtensionRequests, deps.output);
 		return true;
 	}
 
@@ -1729,7 +1763,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		if (!heldFrames) {
 			inputDispatcher.dispatch(parsed);
 		} else if (isRpcExtensionUIResponse(parsed)) {
-			pendingExtensionRequests.get(parsed.id)?.resolve(parsed);
+			try {
+				dispatchExtensionUIResponse(parsed, pendingExtensionRequests, output);
+			} catch (cause) {
+				output(error(undefined, "parse", cause instanceof Error ? cause.message : String(cause)));
+			}
 		} else if (isRecord(parsed) && parsed.type === "set_ask_dialog") {
 			output(setAskDialog(parsed as RpcCommand & { type: "set_ask_dialog" }));
 		} else {

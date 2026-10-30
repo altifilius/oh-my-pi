@@ -6059,8 +6059,9 @@ func (v *AskAnswer) decodeFrom(raw map[string]json.RawMessage) error {
 
 // Answers a `select`, `input`, or `editor` request.
 type ValueUiResponse struct {
-	ID    string `json:"id"`
-	Value string `json:"value"`
+	ID         string  `json:"id"`
+	Value      string  `json:"value"`
+	ResponseID *string `json:"responseId,omitempty"`
 }
 
 func (v *ValueUiResponse) UnmarshalJSON(data []byte) error {
@@ -6073,6 +6074,7 @@ func (v *ValueUiResponse) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "extension_ui_response")
 	d.required("id", &out.ID)
 	d.required("value", &out.Value)
+	d.optional("responseId", &out.ResponseID)
 	if d.err != nil {
 		return d.err
 	}
@@ -6087,8 +6089,9 @@ func (v ValueUiResponse) MarshalJSON() ([]byte, error) {
 
 // Answers a `confirm` request.
 type ConfirmUiResponse struct {
-	ID        string `json:"id"`
-	Confirmed bool   `json:"confirmed"`
+	ID         string  `json:"id"`
+	Confirmed  bool    `json:"confirmed"`
+	ResponseID *string `json:"responseId,omitempty"`
 }
 
 func (v *ConfirmUiResponse) UnmarshalJSON(data []byte) error {
@@ -6101,6 +6104,7 @@ func (v *ConfirmUiResponse) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "extension_ui_response")
 	d.required("id", &out.ID)
 	d.required("confirmed", &out.Confirmed)
+	d.optional("responseId", &out.ResponseID)
 	if d.err != nil {
 		return d.err
 	}
@@ -6115,8 +6119,9 @@ func (v ConfirmUiResponse) MarshalJSON() ([]byte, error) {
 
 // Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` then takes its recommended answers).
 type CancelUiResponse struct {
-	ID       string `json:"id"`
-	TimedOut *bool  `json:"timedOut,omitempty"`
+	ID         string  `json:"id"`
+	ResponseID *string `json:"responseId,omitempty"`
+	TimedOut   *bool   `json:"timedOut,omitempty"`
 }
 
 func (v *CancelUiResponse) UnmarshalJSON(data []byte) error {
@@ -6129,6 +6134,7 @@ func (v *CancelUiResponse) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "extension_ui_response")
 	d.required("id", &out.ID)
 	d.constant("cancelled", true)
+	d.optional("responseId", &out.ResponseID)
 	d.optional("timedOut", &out.TimedOut)
 	if d.err != nil {
 		return d.err
@@ -6144,8 +6150,9 @@ func (v CancelUiResponse) MarshalJSON() ([]byte, error) {
 
 // Answers an `ask` request: one `AskAnswer` per question, in question order.
 type AnswersUiResponse struct {
-	ID      string      `json:"id"`
-	Answers []AskAnswer `json:"answers"`
+	ID         string      `json:"id"`
+	Answers    []AskAnswer `json:"answers"`
+	ResponseID *string     `json:"responseId,omitempty"`
 }
 
 func (v *AnswersUiResponse) UnmarshalJSON(data []byte) error {
@@ -6158,6 +6165,7 @@ func (v *AnswersUiResponse) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("type", "extension_ui_response")
 	d.required("id", &out.ID)
 	d.required("answers", &out.Answers)
+	d.optional("responseId", &out.ResponseID)
 	if d.err != nil {
 		return d.err
 	}
@@ -6170,7 +6178,7 @@ func (v AnswersUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"extension_ui_response"`, nil)
 }
 
-// Host reply to an extension UI request; variants share `type` and differ by their payload key.
+// Host reply to an extension UI request. Optional responseId requests a delivery response correlated by that id; id still targets the original question.
 type ExtensionUiResponse struct {
 	// Value holds one variant. Encode-only: no discriminator tells the variants apart.
 	Value ExtensionUiResponseVariant

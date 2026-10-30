@@ -1372,6 +1372,7 @@ export interface ValueUiResponse {
 	type: "extension_ui_response";
 	id: string;
 	value: string;
+	responseId?: string;
 }
 
 /** Answers a `confirm` request. */
@@ -1379,6 +1380,7 @@ export interface ConfirmUiResponse {
 	type: "extension_ui_response";
 	id: string;
 	confirmed: boolean;
+	responseId?: string;
 }
 
 /** Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` then takes its recommended answers). */
@@ -1386,6 +1388,7 @@ export interface CancelUiResponse {
 	type: "extension_ui_response";
 	id: string;
 	cancelled: true;
+	responseId?: string;
 	timedOut?: boolean;
 }
 
@@ -1394,9 +1397,10 @@ export interface AnswersUiResponse {
 	type: "extension_ui_response";
 	id: string;
 	answers: AskAnswer[];
+	responseId?: string;
 }
 
-/** Host reply to an extension UI request; variants share `type` and differ by their payload key. */
+/** Host reply to an extension UI request. Optional responseId requests a delivery response correlated by that id; id still targets the original question. */
 export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse;
 
 export interface HostToolCallRequest {

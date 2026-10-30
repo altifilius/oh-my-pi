@@ -238,24 +238,30 @@ export const frameDefs = {
 		"Answer to one `ask` question: exact option labels, plus optional free text.",
 	),
 	ValueUiResponse: doc(
-		{ type: "'extension_ui_response'", id: "string", value: "string" },
+		{ type: "'extension_ui_response'", id: "string", "responseId?": "string", value: "string" },
 		"Answers a `select`, `input`, or `editor` request.",
 	),
 	ConfirmUiResponse: doc(
-		{ type: "'extension_ui_response'", id: "string", confirmed: "boolean" },
+		{ type: "'extension_ui_response'", id: "string", "responseId?": "string", confirmed: "boolean" },
 		"Answers a `confirm` request.",
 	),
 	CancelUiResponse: doc(
-		{ type: "'extension_ui_response'", id: "string", cancelled: "true", "timedOut?": "boolean" },
+		{
+			type: "'extension_ui_response'",
+			id: "string",
+			"responseId?": "string",
+			cancelled: "true",
+			"timedOut?": "boolean",
+		},
 		"Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` then takes its recommended answers).",
 	),
 	AnswersUiResponse: doc(
-		{ type: "'extension_ui_response'", id: "string", answers: "AskAnswer[]" },
+		{ type: "'extension_ui_response'", id: "string", "responseId?": "string", answers: "AskAnswer[]" },
 		"Answers an `ask` request: one `AskAnswer` per question, in question order.",
 	),
 	ExtensionUiResponse: doc(
 		"ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse",
-		"Host reply to an extension UI request; variants share `type` and differ by their payload key.",
+		"Host reply to an extension UI request. Optional responseId requests a delivery response correlated by that id; id still targets the original question.",
 	),
 
 	HostToolCallRequest: {

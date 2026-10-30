@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- RPC extension UI replies can opt into delivery receipts with `responseId`; stale, aborted and already-answered questions return a correlated `stale_interaction` result instead of silent ambiguity. Existing replies without `responseId` are unchanged.
+
 ## [18.14.0] - 2026-10-29
 
 ### Breaking Changes

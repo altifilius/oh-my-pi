@@ -5510,6 +5510,9 @@
 				},
 				"value": {
 					"type": "string"
+				},
+				"responseId": {
+					"type": "string"
 				}
 			},
 			"required": [
@@ -5530,6 +5533,9 @@
 				},
 				"confirmed": {
 					"type": "boolean"
+				},
+				"responseId": {
+					"type": "string"
 				}
 			},
 			"required": [
@@ -5550,6 +5556,9 @@
 				},
 				"cancelled": {
 					"const": true
+				},
+				"responseId": {
+					"type": "string"
 				},
 				"timedOut": {
 					"type": "boolean"
@@ -5576,6 +5585,9 @@
 					"items": {
 						"$ref": "#/$defs/AskAnswer"
 					}
+				},
+				"responseId": {
+					"type": "string"
 				}
 			},
 			"required": [
@@ -5600,7 +5612,7 @@
 					"$ref": "#/$defs/AnswersUiResponse"
 				}
 			],
-			"description": "Host reply to an extension UI request; variants share `type` and differ by their payload key."
+			"description": "Host reply to an extension UI request. Optional responseId requests a delivery response correlated by that id; id still targets the original question."
 		},
 		"HostToolCallRequest": {
 			"type": "object",
