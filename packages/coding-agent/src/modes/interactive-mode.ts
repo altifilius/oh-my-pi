@@ -373,6 +373,7 @@ import {
 	askTimeoutMs,
 	cfgAutocompleteMaxVisible,
 	cfgComposerPredictions,
+	cfgComposerResources,
 	cfgComposerShape,
 	cfgComposerTokenRate,
 	cfgDisplayAdvisorCollapsedLines,
@@ -462,6 +463,8 @@ const cfgLiveUiSettings = combine({
 	"spelling.autocomplete": cfgSpellingAutocomplete,
 	"spelling.autocorrect": cfgSpellingAutocorrect,
 	"composer.shape": cfgComposerShape,
+	"composer.resources": cfgComposerResources,
+	"composer.tokenRate": cfgComposerTokenRate,
 	"tui.vimMode": cfgTuiVimMode,
 	"tui.vimModeDisplay": cfgTuiVimModeDisplay,
 	"display.pinnedAgents": cfgDisplayPinnedAgents,
@@ -2466,17 +2469,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.composer.setHeaderExtras(headerBefore, headerAfter);
 		this.statusLine.watchBranch(() => this.ui.requestRender());
 		this.composer.setStatusComponent(this.statusLine);
-		this.#resourceMonitor?.dispose();
-		this.#resourceMonitor = new SessionResourceMonitor({
-			getSessionId: () => this.sessionManager.getSessionId(),
-			getCwd: () => this.sessionManager.getCwd(),
-			getSessionFamily: () => resourceSessionFamily(this.session, AgentRegistry.global()),
-			onUpdate: snapshot => {
-				this.editor.resourceUsage = snapshot;
-				this.ui.requestRender();
-			},
-		});
-		this.#resourceMonitor.start();
+		this.#syncResourceMonitor();
 
 		this.composer.setRuntimeChildren(
 			[
@@ -4087,6 +4080,27 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
 	}
 
+	#syncResourceMonitor(): void {
+		if (!cfgComposerResources.get(this.settings)) {
+			this.#resourceMonitor?.dispose();
+			this.#resourceMonitor = undefined;
+			this.editor.resourceUsage = undefined;
+			this.ui.requestRender();
+			return;
+		}
+		if (this.#resourceMonitor) return;
+		this.#resourceMonitor = new SessionResourceMonitor({
+			getSessionId: () => this.sessionManager.getSessionId(),
+			getCwd: () => this.sessionManager.getCwd(),
+			getSessionFamily: () => resourceSessionFamily(this.session, AgentRegistry.global()),
+			onUpdate: snapshot => {
+				this.editor.resourceUsage = snapshot;
+				this.ui.requestRender();
+			},
+		});
+		this.#resourceMonitor.start();
+	}
+
 	/** Live-setting composer preferences; `quiet` is startup-only and `composerShape` flows through {@link syncComposerShape}. */
 	#liveComposerPreferences(): Omit<ComposerPreferences, "quiet" | "composerShape"> {
 		return {
@@ -4157,6 +4171,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.updateEditorBorderColor();
 		}
 		if (any("composer.shape")) this.syncComposerShape();
+		if (any("composer.resources")) this.#syncResourceMonitor();
+		if (any("composer.tokenRate")) this.ui.requestRender();
 		if (any("tui.vimMode", "tui.vimModeDisplay")) this.#applyVimModeSetting();
 		if (any("display.pinnedAgents")) this.applyPinnedAgentsSetting();
 		if (any("display.subagentLivePreview")) {

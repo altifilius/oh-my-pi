@@ -149,6 +149,19 @@ export const cfgComposerTokenRate = register({
 	},
 });
 
+export const cfgComposerResources = register({
+	id: "composer.resources",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "appearance",
+		group: "Composer",
+		label: "Session Resources",
+		description:
+			"Show this session's CPU, RAM, swap and available GPU/VRAM beside tok/s. Independent of Generation Rate; disabling stops resource sampling.",
+	},
+});
+
 // Status line
 export const cfgStatusLinePreset = register({
 	id: "statusLine.preset",

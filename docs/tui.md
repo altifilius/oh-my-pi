@@ -56,6 +56,13 @@ resource admission. Narrow terminals preserve throughput first and then CPU/RAM;
 trailing complete metric groups disappear rather than overflow. `—` means an
 unavailable reading, not zero, and `~` marks partial coverage.
 
+Use `/settings` → Appearance → Composer → Session Resources to toggle the
+indicator (`composer.resources`, default `true`). It is independent of
+Generation Rate (`composer.tokenRate`). Disabling clears ANSI/native readings
+immediately and disposes the sampler, including pending GPU queries; enabling
+starts fresh sampling without restarting the session. The setting persists
+through the standard settings store.
+
 Linux CPU/RAM/swap readings refresh approximately every two seconds, without
 overlapping reads. CPU 100% means one logical CPU; parallel work can exceed
 100%. RAM sums proportional resident memory (`Pss`), and swap sums `SwapPss`

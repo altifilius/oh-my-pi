@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Make session resource monitoring switchable through Session Resources (`composer.resources`), independently of Generation Rate; changes immediately clear/restart sampling and refresh both composer renderers.
 - Startup prewalk now arms a later fallback candidate of the role named by prewalk.into when its first candidate is unavailable, matching /prewalk and /new ([#17373](https://github.com/can1357/oh-my-pi/pull/17373)).
 
 ## [18.14.0] - 2026-10-29
