@@ -116,7 +116,7 @@ export class Loader extends Text {
 	}[];
 	#layoutFrames: readonly string[];
 	#layoutFrame: string;
-	#trailer?: () => string | undefined;
+	#trailer?: (width: number) => string | undefined;
 	#native?: { message: string; trailer: string; shimmer: boolean; node: NativeNode };
 	#working?: { spec: () => WorkingRowSpec; interrupt: () => void };
 	#workingNative?: { key: string; node: NativeNode };
@@ -205,14 +205,12 @@ export class Loader extends Text {
 			);
 		}
 		if (this.#trailer && lines.length > 1) {
-			const trailer = this.#trailer();
+			// Text pads rows to full width; drop that pad before docking right.
+			const body = lines[1].trimEnd();
+			const bodyWidth =
+				layout[0].bodyWidth === undefined ? visibleWidth(body) : layout[0].bodyWidth + visibleWidth(coloredSpinner);
+			const trailer = this.#trailer(Math.max(0, width - bodyWidth - 2));
 			if (trailer) {
-				// Text pads rows to full width; drop that pad before docking right.
-				const body = lines[1].trimEnd();
-				const bodyWidth =
-					layout[0].bodyWidth === undefined
-						? visibleWidth(body)
-						: layout[0].bodyWidth + visibleWidth(coloredSpinner);
 				const gap = width - bodyWidth - visibleWidth(trailer);
 				if (gap >= 2) lines[1] = body + padding(gap) + trailer;
 			}
@@ -229,7 +227,7 @@ export class Loader extends Text {
 	override describe(cx: DescribeContext): NativeNode {
 		if (this.#working) return this.#describeWorking(cx);
 		const message = plainText(this.#resolveMessage());
-		const trailer = plainText(this.#trailer?.() ?? "");
+		const trailer = plainText(this.#trailer?.(cx.cols) ?? "");
 		const shimmer = this.messageColorFn.animated === true && shimmerEnabled();
 		const cached = this.#native;
 		if (cached && cached.message === message && cached.trailer === trailer && cached.shimmer === shimmer) {
@@ -325,10 +323,10 @@ export class Loader extends Text {
 	dispose() {
 		this.stop();
 	}
-	/** Install a lazy right-docked suffix for the spinner row (e.g. a styled
-	 * session title). Re-evaluated every paint; dropped when the row leaves
-	 * less than a two-cell gap. */
-	setTrailer(trailer: (() => string | undefined) | undefined): void {
+	/** Install a lazy right-docked suffix for the spinner row. Receives the
+	 * available cells after the body and two-cell gap (native: viewport width).
+	 * Re-evaluated every paint; existing no-argument callbacks remain valid. */
+	setTrailer(trailer: ((width: number) => string | undefined) | undefined): void {
 		this.#trailer = trailer;
 	}
 

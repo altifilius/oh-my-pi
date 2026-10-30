@@ -5,6 +5,7 @@
 ### Added
 
 - Added queueable compaction: `/compact` sent with the follow-up key (Ctrl+Q) while the agent works now runs when it yields instead of interrupting it ([#17397](https://github.com/can1357/oh-my-pi/pull/17397) by [@H4vC](https://github.com/H4vC))
+- Show session process-family CPU, proportional RAM, swap and optional NVIDIA GPU/VRAM beside the existing above-input tok/s readout, independently of model/tool admission; unavailable and partial readings stay explicit.
 
 ### Fixed
 

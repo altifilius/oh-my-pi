@@ -5,6 +5,7 @@
 ### Added
 
 - Added a `maxRows` callback to `FigureMarkdown`, `SvgFigure` and `TableChartFigure` so surfaces shorter than the screen can fit their figures; zero hides a figure without delaying transcript completion ([#15661](https://github.com/can1357/oh-my-pi/issues/15661), [#15853](https://github.com/can1357/oh-my-pi/pull/15853) by [@KunoLu](https://github.com/KunoLu))
+- Add inline `CustomEditor.resourceUsage`/`resourceLabel(width)` alongside the native composer's rate and width-aware Loader trailers; keep metrics beside throughput without adding editor rows or moving input focus.
 
 ## [18.14.0] - 2026-10-29
 

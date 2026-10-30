@@ -182,6 +182,7 @@ import { resolveToCwd } from "../tools/path-utils";
 import { StreamPublisher } from "../stream/publisher";
 import { newRecordingPath, SessionRecorder } from "../stream/recording";
 import { StreamRedactor } from "../stream/redactor";
+import { resourceSessionFamily, SessionResourceMonitor } from "../session/resource-monitor";
 import {
 	FEED_MODEL_BADGE_WIDTH,
 	formatFeedModelBadge,
@@ -283,6 +284,7 @@ import { JobsSheet } from "@oh-my-pi/pi-tui/overlays/jobs-panel";
 import { SkillMessageComponent } from "@oh-my-pi/pi-tui/chat/skill-message";
 import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
 import { statusLineHost } from "./status-line-host";
+import { workingRowTrailer } from "./working-row-trailer";
 import { stopSharedSpinnerTicker, type ToolExecutionHandle } from "@oh-my-pi/pi-tui/chat/tool-execution";
 import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { Composer, type ComposerPreferences, type ComposerStatusCache } from "@oh-my-pi/pi-tui/prompt/composer";
@@ -1509,18 +1511,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (rate === null) return undefined;
 		return theme.fg("dim", `${theme.icon.throughput} ${rate.toFixed(1)} tok/s`);
 	}
-	/** Right-docked suffix of the working row: the tok/s readout, then the band-mode title. */
-	#workingRowTrailer(): string | undefined {
-		const rate = this.#tokenRateLabel();
-		const title = this.#workingTitleTrailer();
-		if (rate && title) return `${rate}  ${title}`;
-		return rate ?? title;
+	/** Right-docked suffix: throughput, resource metrics, then the band title. */
+	#workingRowTrailer(width: number): string | undefined {
+		return workingRowTrailer(
+			width,
+			this.#tokenRateLabel(),
+			available => this.editor.resourceLabel(available),
+			this.#workingTitleTrailer(),
+		);
 	}
 	/** Idle stand-in for the working row: the last tok/s reading and the
 	 * band-mode title stay readable between turns, docked where the loader's
 	 * trailer was. */
 	renderIdleStatusHud(width: number): readonly string[] | undefined {
-		const trailer = this.#workingRowTrailer();
+		const trailer = this.#workingRowTrailer(width);
 		if (!trailer) return undefined;
 		return ["", " ".repeat(Math.max(0, width - visibleWidth(trailer))) + trailer];
 	}
@@ -1732,6 +1736,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#autocompleteProviderFactories: AutocompleteProviderFactory[] = [];
 	#cleanupUnsubscribe?: () => void;
 	#signalTeardown?: SessionTeardown;
+	#resourceMonitor: SessionResourceMonitor | undefined;
 	readonly #version: string;
 	readonly #startupChangelog: StartupChangelogSelection | undefined;
 	/** Header components below the config warnings + welcome, retained so a live config-warning change can rebuild the header (#10048). */
@@ -1930,6 +1935,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	clearTransientSessionUi(options?: { viewOnly?: boolean }): void {
+		this.editor.resourceUsage = undefined;
 		this.#hideSessionInfo();
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
@@ -2460,6 +2466,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.composer.setHeaderExtras(headerBefore, headerAfter);
 		this.statusLine.watchBranch(() => this.ui.requestRender());
 		this.composer.setStatusComponent(this.statusLine);
+		this.#resourceMonitor?.dispose();
+		this.#resourceMonitor = new SessionResourceMonitor({
+			getSessionId: () => this.sessionManager.getSessionId(),
+			getCwd: () => this.sessionManager.getCwd(),
+			getSessionFamily: () => resourceSessionFamily(this.session, AgentRegistry.global()),
+			onUpdate: snapshot => {
+				this.editor.resourceUsage = snapshot;
+				this.ui.requestRender();
+			},
+		});
+		this.#resourceMonitor.start();
 
 		this.composer.setRuntimeChildren(
 			[
@@ -7824,6 +7841,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	stop(): void {
 		this.syncIdleMaintenanceView(null);
+		this.#resourceMonitor?.dispose();
+		this.#resourceMonitor = undefined;
+		this.editor.resourceUsage = undefined;
 		this.#hidePlanReview();
 		this.#appearanceRefreshRequest = undefined;
 		// Settle any pending approval prompt as dismissed (deny). The
@@ -8200,6 +8220,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		nextEditor.composerState = () => this.#composerNativeState();
 		nextEditor.onToggleDictation = () => void this.#toggleComposerDictation();
 		nextEditor.attachmentChips = previousEditor.attachmentChips;
+		nextEditor.resourceUsage = previousEditor.resourceUsage;
 		nextEditor.imageReferenceHyperlink = imageReferenceHyperlink;
 		nextEditor.skillFilePath = name => this.skillCommands.get(`skill:${name}`)?.filePath;
 		nextEditor.modelMentionLabel = selector => {
@@ -8554,7 +8575,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				// status rows so the interrupt glyph reads as indented.
 				[` ${appKey(this.keybindings, "app.interrupt")}`],
 			);
-			this.loadingAnimation.setTrailer(() => this.#workingRowTrailer());
+			this.loadingAnimation.setTrailer(width => this.#workingRowTrailer(width));
 			this.loadingAnimation.setWorkingRow(
 				() => this.#workingRowSpec(),
 				() => this.interruptFromPointer(),

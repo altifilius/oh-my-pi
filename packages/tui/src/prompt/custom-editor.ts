@@ -1,5 +1,6 @@
 import * as url from "node:url";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { formatBytes } from "@oh-my-pi/pi-utils";
 import { BracketedPasteHandler } from "../bracketed-paste";
 import { BRACKETED_PASTE_END, BRACKETED_PASTE_START } from "../stdin-buffer";
 import {
@@ -46,6 +47,7 @@ import { isNativeRendering } from "../native/state";
 import { isQueuedMessageList, parseQueueShorthand, QUEUE_LIST_MARKER_RE } from "./queue-input";
 import { type WordCompletionMethod, WordCompletionProvider } from "./word-completion";
 import { fgOrPlain, theme } from "../theme/theme";
+import { visibleWidth } from "../utils";
 
 /** A shell-mode draft's sigil (`!`, `!!`, `$`, `$$`) with its surrounding blanks; the mode chip stands in for it natively. */
 const SHELL_SIGIL_RE = /^\s*(?:!!?|\$\$?)[ \t]?/;
@@ -71,6 +73,34 @@ export interface ComposerNativeState {
 	readonly viewing?: readonly string[];
 	/** The session's title, quoted in italics as the TSP placeholder; undefined until it has one. */
 	readonly title?: string;
+}
+
+/** Process-family aggregate for this session, including in-process subagents; null means unavailable. */
+export interface ComposerResourceUsage {
+	/** 100% is one CPU core. */
+	readonly cpuPercent: number | null;
+	readonly memoryBytes: number | null;
+	readonly swapBytes: number | null;
+	readonly gpuPercent: number | null;
+	readonly vramBytes: number | null;
+	readonly processCount: number;
+	/** Some owned processes or measurements could not be accounted for. */
+	readonly partial: boolean;
+}
+
+const RESOURCE_FIELDS = [
+	"cpuPercent",
+	"memoryBytes",
+	"swapBytes",
+	"gpuPercent",
+	"vramBytes",
+	"processCount",
+	"partial",
+] as const;
+
+function resourceValue(value: number | null, bytes = false): string {
+	if (value === null || !Number.isFinite(value) || value < 0) return "—";
+	return bytes ? formatBytes(value) : `${Math.round(value)}%`;
 }
 
 /** Action code prefix of the viewing header's links: `focus:<agent id>`, {@link MAIN_AGENT_ID} for the main session. */
@@ -464,6 +494,79 @@ export class CustomEditor extends Editor {
 	#spelling = new MacOSSpellingProvider();
 	/** The word being typed: its typo mark waits until the caret leaves it. */
 	#typing = new TypingWordTracker();
+	#resourceUsage: ComposerResourceUsage | undefined;
+	#resources:
+		| {
+				labels: readonly { text: string; width: number }[];
+				title: string;
+				native?: { width: number; node: NativeNode | undefined };
+		  }
+		| undefined;
+
+	/** Session-local metrics beside the generation rate; undefined hides them. */
+	get resourceUsage(): ComposerResourceUsage | undefined {
+		return this.#resourceUsage;
+	}
+	set resourceUsage(usage: ComposerResourceUsage | undefined) {
+		if (usage === undefined && this.#resourceUsage === undefined) return;
+		if (usage && this.#resourceUsage && RESOURCE_FIELDS.every(field => usage[field] === this.#resourceUsage![field]))
+			return;
+		this.#resourceUsage = usage && { ...usage };
+		if (usage) {
+			const groups = [
+				`CPU ${resourceValue(usage.cpuPercent)}`,
+				`RAM ${resourceValue(usage.memoryBytes, true)}`,
+				`SWAP ${resourceValue(usage.swapBytes, true)}`,
+				`GPU ${resourceValue(usage.gpuPercent)}`,
+				`VRAM ${resourceValue(usage.vramBytes, true)}`,
+			];
+			const labels = [];
+			for (let count = groups.length; count > 0; count--) {
+				const text = (usage.partial ? "~ " : "") + groups.slice(0, count).join(" · ");
+				labels.push({ text, width: visibleWidth(text) });
+			}
+			this.#resources = {
+				labels,
+				title:
+					`Session process-family aggregate, including in-process subagents: ${groups.join("; ")}. ` +
+					`${usage.processCount} processes. CPU 100% is one core. ` +
+					(usage.partial ? "Partial coverage (~); some owned resources are unavailable. " : "") +
+					"— means unavailable. Narrow layouts hide trailing metrics.",
+			};
+		} else {
+			this.#resources = undefined;
+		}
+		this.invalidate();
+	}
+
+	/** Muted inline metrics, without padding or rows; narrow layouts drop complete groups, CPU and RAM last. */
+	resourceLabel(width: number): string | undefined {
+		const label = this.#resources?.labels.find(label => label.width <= width);
+		return label && fgOrPlain("muted", label.text);
+	}
+
+	#describeResources(width: number): NativeNode | undefined {
+		const resources = this.#resources;
+		if (!resources) return undefined;
+		if (resources.native?.width === width) return resources.native.node;
+		const label = resources.labels.find(label => label.width <= width);
+		const usage = label
+			? node(
+					"text",
+					{
+						role: "omp.composer.resources",
+						spans: [span(label.text, "muted")],
+						wrap: "none",
+						shrink: 0,
+						title: resources.title,
+					},
+					undefined,
+					"resources",
+				)
+			: undefined;
+		resources.native = { width, node: usage };
+		return usage;
+	}
 	#wordCompletion = new WordCompletionProvider();
 	imageLinks?: readonly (string | undefined)[];
 
@@ -1096,6 +1199,7 @@ export class CustomEditor extends Editor {
 				key: string;
 				facts: ComposerFacts | undefined;
 				chips: Component | undefined;
+				resources: NativeNode | undefined;
 				input: NativeNode;
 				rate: number | undefined;
 				controls: ComposerControls;
@@ -1137,6 +1241,30 @@ export class CustomEditor extends Editor {
 		].join("\0");
 		const rate = state.rate;
 		const chips = this.attachmentChips;
+		// Reserve the pane edges, send control and bar gaps; flexible status extras yield to the readouts.
+		let resourceWidth = cx.cols - 12;
+		if (this.#resources) {
+			if (facts) {
+				resourceWidth -= 6;
+				for (const part of facts.model.spans) resourceWidth -= visibleWidth(part.t);
+				const usage = facts.usage;
+				if (usage.k === "text") {
+					if (usage.p?.text) resourceWidth -= visibleWidth(usage.p.text) + 3;
+					if (usage.p?.spans) {
+						for (const part of usage.p.spans) resourceWidth -= visibleWidth(part.t);
+						resourceWidth -= 3;
+					}
+				}
+			}
+			if (state.thinking !== undefined && !(facts && effortGlyph && state.thinkingInModel)) {
+				resourceWidth -= visibleWidth(state.thinking) + 5;
+			}
+			if (rate !== undefined) resourceWidth -= visibleWidth(`${rate.toFixed(1)} tok/s`) + 3;
+			if (state.dictation !== undefined) {
+				resourceWidth -= state.dictation === "recording" ? 20 : state.dictation === "idle" ? 4 : 18;
+			}
+		}
+		const resources = this.#describeResources(Math.max(0, resourceWidth));
 		const memo = this.#nativeComposer;
 		if (
 			memo &&
@@ -1144,7 +1272,8 @@ export class CustomEditor extends Editor {
 			memo.rate === rate &&
 			memo.facts === facts &&
 			memo.input === input &&
-			memo.chips === chips
+			memo.chips === chips &&
+			memo.resources === resources
 		) {
 			return memo.layout;
 		}
@@ -1152,9 +1281,9 @@ export class CustomEditor extends Editor {
 			memo?.key === key && memo.facts === facts
 				? memo.controls
 				: this.#describeComposerControls(state, facts, thinkingKey, modelKey, interruptKey, effortGlyph);
-		// The rate ticks while a turn streams: only the bar follows it.
+		// Rate and resource ticks rebuild only the bar, not the input or its controls.
 		const bar =
-			memo?.controls === controls && memo.rate === rate
+			memo?.controls === controls && memo.rate === rate && memo.resources === resources
 				? memo.bar
 				: keyed(
 						row(
@@ -1168,6 +1297,7 @@ export class CustomEditor extends Editor {
 										undefined,
 										"rate",
 									),
+								resources,
 								// The status facts are the bar's flexible space; without them a spacer keeps send at the end.
 								facts?.extras ?? node("row", { grow: 1 }, [], "gap"),
 								facts?.usage,
@@ -1188,7 +1318,7 @@ export class CustomEditor extends Editor {
 			children: compact([facts?.context, controls.focus, chips, line, bar]),
 			caret: "line/input",
 		};
-		this.#nativeComposer = { key, facts, chips, input, rate, controls, bar, layout };
+		this.#nativeComposer = { key, facts, resources, chips, input, rate, controls, bar, layout };
 		return layout;
 	};
 

@@ -46,6 +46,59 @@ Native PTY API changes require rebuilding the addon with
 Run its real-PTY regressions with `bun test ./.omp/tests/tui.test.ts`. CI runs
 them on Linux only; the Windows-specific cases run only on a local Windows host.
 
+## Session resource indicator
+
+The input's existing above-editor working row shows CPU, RAM, swap, GPU and
+VRAM immediately beside the generation-throughput (`tok/s`) readout. It does
+not add an editor row or replace the status strip. Samples run outside the
+model/tool-call lifecycle, including while work is waiting for approval or
+resource admission. Narrow terminals preserve throughput first and then CPU/RAM;
+trailing complete metric groups disappear rather than overflow. `—` means an
+unavailable reading, not zero, and `~` marks partial coverage.
+
+Linux CPU/RAM/swap readings refresh approximately every two seconds, without
+overlapping reads. CPU 100% means one logical CPU; parallel work can exceed
+100%. RAM sums proportional resident memory (`Pss`), and swap sums `SwapPss`
+from `/proc/<pid>/smaps_rollup`, avoiding double-counted shared RSS pages.
+The scope includes the main runtime, its owned descendants, and live services
+whose broker metadata belongs to the exact session/registered descendant family.
+Shared broker/global-worker subtrees and services owned by other sessions are
+excluded. Process birth identities guard against PID reuse; broker service
+births must also match their recorded launch window. The main runtime includes
+in-process subagents and cannot be divided into independent agent heaps.
+Conversation switches reset CPU baselines and do not transfer already-observed
+children to the new conversation. Unmarked children first observed after a
+switch cannot be attributed retroactively; this is process-family accounting,
+not a complete historical resource ledger. Externally shared model servers and
+remote-provider hardware are not charged to one local session.
+Already-observed PID/birth identities remain attributed after reparenting, and
+observed descendant identities remain known after their agent is parked or
+removed while an owned service still runs. Unobserved parked agents or protected
+ownership reads make totals unavailable with partial coverage; they are never
+silently assigned to the active conversation. Tasks that begin and end between
+samples cannot be measured. Published readings clear on a conversation change.
+
+NVIDIA GPU/VRAM is optional: only an owned process already holding a GPU device
+descriptor triggers bounded `nvidia-smi` per-PID sampling, at most once every ten
+seconds. GPU is reported SM utilization; VRAM is framebuffer memory, not memory
+bandwidth utilization. Missing tools, unsupported driver fields and non-Linux
+platforms show unavailable readings rather than inferred host totals. Other GPU
+vendors are not currently measured. No new dependency or background daemon is
+installed, and the sampler never stops workloads or changes resource limits.
+
+The low-level UI accepts `CustomEditor.resourceUsage`; its `resourceLabel(width)`
+returns muted, unpadded inline text, or `undefined` when no complete metric fits.
+The ANSI host docks it after throughput in the existing active/idle trailer;
+Loader trailer callbacks receive the available columns after the working label.
+Native TSP exposes the same metrics immediately after the rate node in
+`composer.bar`, with coverage details in its tooltip and no focusable control.
+No generic editor header or additional height budget is used. Monitor disposal
+cancels its timer/GPU query; editor replacement retains the last snapshot.
+
+Implementation: `session/resource-monitor.ts`, `modes/working-row-trailer.ts` and
+`modes/interactive-mode.ts` in coding-agent, `prompt/custom-editor.ts` and
+`components/loader.ts` in tui.
+
 ## Core component contract (`@oh-my-pi/pi-tui`)
 
 `packages/tui/src/tui.ts` defines:
