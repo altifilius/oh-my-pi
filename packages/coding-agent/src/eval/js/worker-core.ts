@@ -301,6 +301,14 @@ export class WorkerCore {
 
 	#ensureRuntime(snapshot: SessionSnapshot, currentRunId?: string): JsRuntime {
 		this.#syncProcessCwd(snapshot.cwd, currentRunId);
+		// The chdir capability is granted only by process-entry, never by Worker
+		// threads or same-realm harnesses. Native env writes have the same ownership.
+		if (this.#options.mode === "isolated" && this.#options.chdir && snapshot.processEnv) {
+			for (const [key, value] of Object.entries(snapshot.processEnv)) {
+				if (value === null) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 		if (this.#runtime) {
 			this.#runtime.setCwd(snapshot.cwd);
 			this.#runtime.setPackageRoot(snapshot.packageRoot);

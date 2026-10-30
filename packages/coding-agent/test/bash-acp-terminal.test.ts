@@ -8,6 +8,7 @@ import type { ClientBridge, ClientBridgeTerminalHandle } from "@oh-my-pi/pi-codi
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { encodeTerminalImage } from "@oh-my-pi/pi-coding-agent/utils/terminal-graphics";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 
 // `getShellConfig()` validates that `shellPath` exists, and `/bin/bash` does not
 // on Windows. The ACP route only forwards the path to the stubbed client
@@ -198,8 +199,8 @@ describe("BashTool ACP terminal routing", () => {
 
 		const tool = new BashTool(makeSession(bridge));
 
-		await expect(tool.execute("call-pre-abort", { command: "echo hi" }, controller.signal)).rejects.toThrow(
-			/Command aborted/,
+		await expect(tool.execute("call-pre-abort", { command: "echo hi" }, controller.signal)).rejects.toBeInstanceOf(
+			ToolAbortError,
 		);
 
 		expect(createSpy).toHaveBeenCalledTimes(0);

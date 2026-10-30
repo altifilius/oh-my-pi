@@ -66,6 +66,21 @@ describe("stageRunnerScript re-validation", () => {
 		expect(fs.existsSync(second)).toBe(true);
 	});
 
+	it("isolates cached runners between execution temporary roots", async () => {
+		const root = path.join(os.tmpdir(), uniqueDir());
+		const firstRoot = path.join(root, "first");
+		const secondRoot = path.join(root, "second");
+		const first = await stageRunnerScript("python", "py", "print(42)\n", firstRoot);
+		const second = await stageRunnerScript("python", "py", "print(42)\n", secondRoot);
+		expect(path.relative(firstRoot, first)).not.toStartWith("..");
+		expect(path.relative(secondRoot, second)).not.toStartWith("..");
+		fs.rmSync(firstRoot, { recursive: true });
+		expect(await Bun.file(second).text()).toBe("print(42)\n");
+		expect(await Bun.file(await stageRunnerScript("python", "py", "print(42)\n", firstRoot)).text()).toBe(
+			"print(42)\n",
+		);
+	});
+
 	// The shared, un-suffixed tmpdir name may be owned by another account (e.g.
 	// root created it 0755 first); staging must not write into it, or every other
 	// user's Python eval fails with EACCES. A non-writable dir stands in for the

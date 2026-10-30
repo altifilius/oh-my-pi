@@ -42,6 +42,7 @@ import {
 import { resolveDaemonSpawnOptions } from "./spawn-options";
 import { renderTerminalOutput } from "./terminal-output";
 import { quotePosixArgv } from "../utils/shell-quote";
+import { prepareProcessResources, type ProcessResourceLease } from "../exec/process-resources";
 
 const DEFAULT_IDLE_GRACE_MS = 3_000;
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -117,6 +118,9 @@ interface ManagedDaemon {
 	persistedSpec?: string;
 	/** Serialized metadata last written (or recovered); a write is skipped while unchanged. */
 	persistedMeta?: string;
+	resourceLease?: ProcessResourceLease;
+	resourceAbort?: AbortController;
+	launchSpec?: DaemonSpec;
 }
 
 interface BrokerLease {
@@ -785,6 +789,8 @@ class DaemonBroker {
 
 	async #launch(record: ManagedDaemon): Promise<void> {
 		record.generation++;
+		record.resourceAbort?.abort();
+		record.resourceAbort = new AbortController();
 		const generation = record.generation;
 		record.stopRequested = false;
 		record.snapshot.state = record.spec.ready ? "starting" : "running";
@@ -804,6 +810,29 @@ class DaemonBroker {
 		record.outputOffset = 0;
 		this.#persist(record);
 		try {
+			if (record.spec.processResources) {
+				if (record.spec.args.at(-1) !== record.spec.processResources.command)
+					throw new Error("Process resource command must match the shell command argument");
+				const resources = await prepareProcessResources({
+					cwd: this.#projectDir,
+					owner: record.snapshot.owner ?? this.#projectDir,
+					command: record.spec.processResources.command,
+					env: record.spec.env,
+					signal: record.resourceAbort.signal,
+					options: record.spec.processResources.options,
+				});
+				if (record.stopRequested || generation !== record.generation || this.#shuttingDown) {
+					await resources.release();
+					throw new Error("Service start cancelled while waiting for process resources");
+				}
+				record.resourceLease = resources;
+				record.launchSpec = {
+					...record.spec,
+					env: resources.env,
+					args: [...record.spec.args.slice(0, -1), resources.command],
+				};
+				for (const notice of resources.notices) record.log?.append(`[process resources: ${notice}]\n`);
+			} else record.launchSpec = record.spec;
 			if (record.spec.detached) await this.#launchDetached(record, generation);
 			else if (record.spec.pty) await this.#launchPty(record, generation);
 			else this.#launchPipe(record, generation);
@@ -821,7 +850,7 @@ class DaemonBroker {
 		record.pty = session;
 		const options = {
 			cwd: record.spec.cwd,
-			env: workerEnvFromParent({ TERM: "xterm-256color", ...record.spec.env }),
+			env: workerEnvFromParent({ TERM: "xterm-256color", ...(record.launchSpec ?? record.spec).env }),
 			cols: DAEMON_PTY_COLUMNS,
 			rows: DAEMON_PTY_ROWS,
 		};
@@ -869,14 +898,14 @@ class DaemonBroker {
 			run = session.startArgv(
 				{
 					application: record.spec.application,
-					args: record.spec.args,
+					args: (record.launchSpec ?? record.spec).args,
 					...options,
 				},
 				onChunk,
 				onStart,
 			);
 		} else {
-			const argv = [record.spec.application, ...record.spec.args];
+			const argv = [record.spec.application, ...(record.launchSpec ?? record.spec).args];
 			const command = `exec ${quotePosixArgv(argv)}`;
 			const shell = procmgr.getShellConfig().shell;
 			run = session.start({ command, shell, ...options }, onChunk, onStart);
@@ -900,9 +929,9 @@ class DaemonBroker {
 	}
 
 	#launchPipe(record: ManagedDaemon, generation: number): void {
-		const process = Bun.spawn([record.spec.application, ...record.spec.args], {
+		const process = Bun.spawn([record.spec.application, ...(record.launchSpec ?? record.spec).args], {
 			cwd: record.spec.cwd,
-			env: workerEnvFromParent(record.spec.env),
+			env: workerEnvFromParent((record.launchSpec ?? record.spec).env),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -925,9 +954,9 @@ class DaemonBroker {
 		const logPath = path.join(record.dir, LOG_FILE);
 		const output = await fs.open(logPath, "a", 0o600);
 		try {
-			const process = Bun.spawn([record.spec.application, ...record.spec.args], {
+			const process = Bun.spawn([record.spec.application, ...(record.launchSpec ?? record.spec).args], {
 				cwd: record.spec.cwd,
-				env: workerEnvFromParent(record.spec.env),
+				env: workerEnvFromParent((record.launchSpec ?? record.spec).env),
 				stdio: ["ignore", output.fd, output.fd],
 				...DAEMON_SPAWN_OPTIONS,
 			});
@@ -1067,6 +1096,9 @@ class DaemonBroker {
 		await this.#readDetachedOutput(record, generation);
 		// The output read yields, so a concurrent refresh may settle this generation first.
 		if (generation !== record.generation || settledState(record.snapshot.state)) return;
+		const resources = record.resourceLease;
+		record.resourceLease = undefined;
+		record.launchSpec = undefined;
 		record.process = undefined;
 		record.input = undefined;
 		record.pty = undefined;
@@ -1089,6 +1121,7 @@ class DaemonBroker {
 			record.snapshot.readyAt = undefined;
 			record.snapshot.readyMatch = undefined;
 			record.snapshot.state = "restarting";
+			await resources?.release();
 			const delay = Math.min(
 				this.#restartBackoffBaseMs * 2 ** Math.min(record.consecutiveFailures, 5),
 				RESTART_MAX_DELAY_MS,
@@ -1104,6 +1137,7 @@ class DaemonBroker {
 			return;
 		}
 		record.snapshot.state = failed && !record.stopRequested ? "failed" : "exited";
+		await resources?.release();
 		const completion =
 			record.snapshot.owner !== undefined &&
 			!record.stopRequested &&
@@ -1273,6 +1307,7 @@ class DaemonBroker {
 		await this.#refreshDetached(record);
 		if (terminalState(record.snapshot.state)) return;
 		record.stopRequested = true;
+		record.resourceAbort?.abort();
 		if (record.restartTimer) {
 			clearTimeout(record.restartTimer);
 			record.restartTimer = undefined;

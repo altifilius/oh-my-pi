@@ -10,6 +10,8 @@
 import * as path from "node:path";
 import { $env, $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
+import { PROCESS_RESOURCE_PARALLEL_ENV_KEYS, projectProcessEnv } from "../../exec/process-resources";
+import { cfgProcessResources } from "../../exec/settings";
 import {
 	BaseKernel,
 	getRemainingTimeMs,
@@ -107,6 +109,7 @@ export interface PythonShadowPlan extends ShadowPlan {
 interface PythonKernelExecuteOptions extends KernelExecuteOptions {
 	expectedShadowRevision?: number;
 	expectedShadowDigest?: string;
+	resourceEnv?: Record<string, string | null>;
 }
 
 // Retain definitive results for synchronous capability advertisement. Execution
@@ -202,6 +205,37 @@ async function probePythonKernelAvailability(
 
 export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 	#installedPreludes = new Map<string, PythonPreludeSource>();
+	#resourceCwd = "";
+	#resourceOwner = "";
+	#resourceSettings!: Settings;
+	#resourceBaseline: Record<string, string> = {};
+	#resourceParallelKeys = new Set<string>();
+
+	/** Only environment hints are applied: opaque Python code is never rewritten. */
+	override async execute(code: string, options?: PythonKernelExecuteOptions): Promise<KernelExecuteResult> {
+		const env: Record<string, string | null> = {};
+		for (const [key, value] of Object.entries(options?.env ?? {})) {
+			if (value !== undefined) env[key] = value;
+		}
+		const baseline = { ...this.#resourceBaseline };
+		for (const key of PROCESS_RESOURCE_PARALLEL_ENV_KEYS) {
+			const value = options?.env?.[key];
+			if (typeof value === "string") baseline[key] = value;
+			else if (value === null) delete baseline[key];
+		}
+		const policy = cfgProcessResources.get(this.#resourceSettings);
+		const managed = await projectProcessEnv({
+			cwd: this.#resourceCwd,
+			owner: this.#resourceOwner,
+			options: policy,
+			env: policy.mode === "off" ? {} : baseline,
+		});
+		for (const key of PROCESS_RESOURCE_PARALLEL_ENV_KEYS) {
+			if (managed[key] !== undefined) this.#resourceParallelKeys.add(key);
+			else if (this.#resourceParallelKeys.delete(key)) env[key] = baseline[key] ?? null;
+		}
+		return await super.execute(code, { ...options, resourceEnv: { ...env, ...managed } });
+	}
 
 	/** @param pythonPath Interpreter executable this kernel runs on; reported as the runtime in eval state. */
 	private constructor(
@@ -221,6 +255,7 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 					cwd: opts?.cwd,
 					filename: opts?.filename,
 					env: opts?.env,
+					resourceEnv: opts?.resourceEnv,
 					silent: opts?.silent ?? false,
 					storeHistory: opts?.storeHistory ?? !(opts?.silent ?? false),
 					expectedShadowRevision: opts?.expectedShadowRevision,
@@ -304,7 +339,9 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		}
 	}
 
-	static async start(options: KernelStartOptions): Promise<PythonKernel> {
+	static async start(
+		options: KernelStartOptions & { resourceOwner?: string; resourceSettings?: Settings },
+	): Promise<PythonKernel> {
 		const availability = await logger.time(
 			"PythonKernel.start:availabilityCheck",
 			checkPythonKernelAvailability,
@@ -332,13 +369,28 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		spawnEnv.PYTHONUNBUFFERED = "1";
 		spawnEnv.PYTHONIOENCODING = "utf-8";
 
-		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
+		const resourceSettings = options.resourceSettings ?? (await Settings.init());
+		const resourceOwner = options.resourceOwner ?? path.resolve(options.cwd);
+		const resourceEnv = await projectProcessEnv({
+			cwd: options.cwd,
+			owner: resourceOwner,
+			options: cfgProcessResources.get(resourceSettings),
+			env: spawnEnv,
+		});
+		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT, resourceEnv.TMPDIR);
 		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
+		kernel.#resourceCwd = options.cwd;
+		kernel.#resourceOwner = resourceOwner;
+		kernel.#resourceSettings = resourceSettings;
+		for (const key of PROCESS_RESOURCE_PARALLEL_ENV_KEYS) {
+			if (spawnEnv[key] !== undefined) kernel.#resourceBaseline[key] = spawnEnv[key];
+			if (resourceEnv[key] !== spawnEnv[key]) kernel.#resourceParallelKeys.add(key);
+		}
 
 		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
 			cwd: options.cwd,
 			detached: shouldDetachKernel(process.platform),
-			env: spawnEnv,
+			env: resourceEnv,
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -354,7 +406,7 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		const startupBudget = Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
 
 		try {
-			const initScript = buildInitScript(options.cwd, options.env);
+			const initScript = buildInitScript(options.cwd, resourceEnv);
 			await kernel.executeWithBudget(initScript, startup.signal, startupBudget, "Python kernel init");
 			await kernel.executeWithBudget(PYTHON_PRELUDE, startup.signal, startupBudget, "Python kernel prelude");
 			return kernel;

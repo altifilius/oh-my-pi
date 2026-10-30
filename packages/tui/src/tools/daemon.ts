@@ -26,6 +26,19 @@ export interface DaemonSpec {
 	restart: DaemonRestartPolicy;
 	persist: boolean;
 	detached: boolean;
+	/** Local execution policy captured by the owning session, not a host resource override. */
+	processResources?: {
+		command: string;
+		options: {
+			mode: "auto" | "conservative" | "off";
+			projectTemp: boolean;
+			minAvailableMemoryBytes: number;
+			minAvailableMemoryRatio: number;
+			memoryStallPercent: number;
+			admissionTimeoutMs: number;
+			maxHeavyJobs: number;
+		};
+	};
 }
 
 /** Serializable daemon state visible to every client in one broker scope. */

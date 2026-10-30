@@ -1,5 +1,12 @@
 import * as path from "node:path";
 import { logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { Settings } from "../../config/settings";
+import {
+	PROCESS_RESOURCE_PARALLEL_ENV_KEYS,
+	projectProcessEnv,
+	type ProcessResourceOptions,
+} from "../../exec/process-resources";
+import { cfgProcessResources } from "../../exec/settings";
 import {
 	createWorkerHandle,
 	createWorkerSubprocess,
@@ -51,9 +58,13 @@ export interface JsEvalWorkerHandle {
 	terminate(): Promise<void>;
 }
 
+export interface JsEvalProcessContext {
+	env: Record<string, string>;
+}
+
 /** Startup dependencies overridden by tests to exercise process-to-Worker recovery. */
 export interface JsEvalWorkerFactories {
-	spawnProcess(): JsEvalWorkerHandle;
+	spawnProcess(context?: JsEvalProcessContext): JsEvalWorkerHandle;
 	spawnWorker(): JsEvalWorkerHandle;
 }
 
@@ -96,6 +107,10 @@ interface JsSession {
 	packageRoot?: string;
 	packageEnvironment?: string;
 	worker: JsEvalWorkerHandle;
+	/** Stable startup project/owner; a later virtual cwd must not retarget cached temp paths. */
+	resourceCwd: string;
+	resourceBaseline: Record<string, string>;
+	resourceParallelKeys: Set<string>;
 	state: "alive" | "dead";
 	stateSessions: Set<ToolSession>;
 	pending: Map<string, PendingRun>;
@@ -449,13 +464,19 @@ export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
  * `omp --smoke-test` so binary / source / tarball installs all exercise it.
  */
 export async function smokeTestJsEvalWorker(): Promise<void> {
-	const worker = spawnJsWorker();
+	const cwd = process.cwd();
+	const policy = cfgProcessResources.get(await Settings.init());
+	const env = await projectProcessEnv({ cwd, owner: "smoke", options: policy, env: workerEnvFromParent() });
+	const worker = spawnJsWorker({ env }, policy);
 	const session: JsSession = {
 		sessionKey: "smoke",
 		sessionId: "smoke",
 		kernelId: `js-${Snowflake.next()}`,
 		cwd: process.cwd(),
 		worker,
+		resourceCwd: cwd,
+		resourceBaseline: {},
+		resourceParallelKeys: new Set(),
 		state: "alive",
 		stateSessions: new Set(),
 		pending: new Map(),
@@ -499,6 +520,7 @@ async function runOnce(
 		expectedDigest?: string;
 	},
 ): Promise<{ value: unknown }> {
+	if (session.worker.mode === "worker") assertFallbackPolicy(cfgProcessResources.get(options.session.settings));
 	const runId = `r-${Snowflake.next()}`;
 	const { promise, resolve, reject } = Promise.withResolvers<{ value: unknown }>();
 	const pending: PendingRun = {
@@ -552,6 +574,7 @@ async function runOnce(
 			preludes: javascriptPreludeSources(options.session),
 			packageRoot: session.packageRoot,
 			packageEnvironment: session.packageEnvironment,
+			processEnv: await sessionProcessEnv(session, options.session),
 		};
 		if (options.expectedRevision !== undefined && options.expectedDigest !== undefined) {
 			const id = `shadow-run-${Snowflake.next()}`;
@@ -617,7 +640,10 @@ async function acquireSession(
 	const startup = (async (): Promise<JsSession> => {
 		// Attach the message listener before sending init. Both Bun Worker messages
 		// and subprocess IPC can arrive immediately after the evaluator loads.
-		const worker = spawnJsWorker();
+		const policy = cfgProcessResources.get(toolSession.settings);
+		const parentEnv = workerEnvFromParent();
+		const env = await projectProcessEnv({ cwd: snapshot.cwd, owner: sessionKey, options: policy, env: parentEnv });
+		const worker = spawnJsWorker({ env }, policy);
 		const session: JsSession = {
 			sessionKey,
 			sessionId: snapshot.sessionId,
@@ -626,6 +652,13 @@ async function acquireSession(
 			packageRoot: snapshot.packageRoot,
 			packageEnvironment: snapshot.packageEnvironment,
 			worker,
+			resourceCwd: snapshot.cwd,
+			resourceBaseline: Object.fromEntries(
+				PROCESS_RESOURCE_PARALLEL_ENV_KEYS.flatMap(key =>
+					parentEnv[key] === undefined ? [] : [[key, parentEnv[key]]],
+				),
+			),
+			resourceParallelKeys: new Set(PROCESS_RESOURCE_PARALLEL_ENV_KEYS.filter(key => env[key] !== parentEnv[key])),
 			state: "alive",
 			stateSessions: new Set(),
 			pending: new Map(),
@@ -658,7 +691,7 @@ async function acquireSession(
 				logger.warn("JS eval subprocess init failed; retrying with a Bun Worker", {
 					error: error instanceof Error ? error.message : String(error),
 				});
-				session.worker = workerFactories.spawnWorker();
+				session.worker = spawnFallbackWorker(policy);
 				session.state = "alive";
 			}
 		}
@@ -964,9 +997,44 @@ async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, reason
 	}
 }
 
-function spawnJsWorker(): JsEvalWorkerHandle {
+/** Re-sample pressure per cell, without rewriting arbitrary JavaScript or resetting its namespace. */
+async function sessionProcessEnv(session: JsSession, toolSession: ToolSession): Promise<Record<string, string | null>> {
+	const env: Record<string, string | null> = {};
+	const policy = cfgProcessResources.get(toolSession.settings);
+	const managed = await projectProcessEnv({
+		cwd: session.resourceCwd,
+		owner: session.sessionKey,
+		options: policy,
+		env: policy.mode === "off" ? {} : session.resourceBaseline,
+	});
+	for (const key of PROCESS_RESOURCE_PARALLEL_ENV_KEYS) {
+		if (managed[key] !== undefined) session.resourceParallelKeys.add(key);
+		else if (session.resourceParallelKeys.delete(key)) env[key] = session.resourceBaseline[key] ?? null;
+	}
+	return Object.assign(env, managed);
+}
+
+function assertFallbackPolicy(policy: ProcessResourceOptions): void {
+	if (policy.mode === "conservative" && policy.projectTemp) {
+		throw new Error(
+			"JS eval requires an isolated subprocess for conservative project-temp policy; Bun Worker fallback cannot safely isolate native temporary files or child-process environment",
+		);
+	}
+}
+
+function spawnFallbackWorker(policy: ProcessResourceOptions): JsEvalWorkerHandle {
+	assertFallbackPolicy(policy);
+	if (policy.mode !== "off") {
+		logger.warn(
+			"JS eval Bun Worker fallback cannot enforce project temporary files or native child-process resource hints; host process environment is unchanged",
+		);
+	}
+	return workerFactories.spawnWorker();
+}
+
+function spawnJsWorker(context: JsEvalProcessContext, policy: ProcessResourceOptions): JsEvalWorkerHandle {
 	try {
-		return workerFactories.spawnProcess();
+		return workerFactories.spawnProcess(context);
 	} catch (error) {
 		// A worker thread remains isolated and can interrupt synchronous user code
 		// via terminate(), so it is the only safe recovery from subprocess spawn.
@@ -974,7 +1042,7 @@ function spawnJsWorker(): JsEvalWorkerHandle {
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
-	return workerFactories.spawnWorker();
+	return spawnFallbackWorker(policy);
 }
 
 function spawnBunWorker(): JsEvalWorkerHandle {
@@ -992,10 +1060,10 @@ function spawnBunWorker(): JsEvalWorkerHandle {
 	}
 }
 
-function spawnJsProcess(): JsEvalWorkerHandle {
+function spawnJsProcess(context?: JsEvalProcessContext): JsEvalWorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
-		env: workerEnvFromParent(),
+		env: context?.env ?? workerEnvFromParent(),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,

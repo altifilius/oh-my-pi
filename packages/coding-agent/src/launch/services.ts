@@ -14,6 +14,7 @@ import { resolveToCwd } from "../tools/path-utils";
 import { isSharedBrowserDaemonName } from "../tools/browser/shared-daemon";
 
 import { cfgLaunchEnabled } from "../tools/settings";
+import { cfgProcessResources } from "../exec/settings";
 
 export interface ServiceReady {
 	log?: string;
@@ -252,6 +253,10 @@ export async function startService(
 		restart: "no",
 		persist: false,
 		detached: false,
+		processResources: {
+			command: `${shell.prefix ? `${shell.prefix} ` : ""}${params.command}`,
+			options: cfgProcessResources.get(session.settings),
+		},
 	};
 	const result = await request(
 		session,

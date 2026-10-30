@@ -2,9 +2,9 @@
  * Shared on-disk staging for subprocess kernel runner scripts.
  *
  * Each language kernel (Python/Julia/Ruby) ships its runner as a compiled-in
- * text asset, then stages it under a per-user directory in `os.tmpdir()` so
- * the interpreter can load it as a normal file. Staging is cached per language
- * directory so repeated kernel starts within a process avoid redundant writes.
+ * text asset, then stages it under a per-user directory in the supplied temporary
+ * root (or `os.tmpdir()`), so the interpreter can load it as a normal file.
+ * Staging is cached per root and language to keep project owners isolated.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -18,7 +18,7 @@ import { assertOwnerPrivateDir } from "../utils/owner-private-dir";
 const stagedPaths = new Map<string, string>();
 
 /**
- * Stage `script` under `os.tmpdir()/<dirName>-<uid>` and return the runner path.
+ * Stage `script` under `<tempRoot>/<dirName>-<uid>` and return the runner path.
  *
  * The directory is per-uid because `os.tmpdir()` is shared between accounts: a
  * single shared name lets whichever account creates it first own it, and every
@@ -28,27 +28,34 @@ const stagedPaths = new Map<string, string>();
  * runner file (whose name is a deterministic hash) for us to execute. A
  * squatted path falls back to a fresh `mkdtemp` directory for this process.
  *
- * The staged path is memoized per `dirName` but re-checked with `fs.existsSync`
+ * The staged path is memoized per root and `dirName` but re-checked with `fs.existsSync`
  * before reuse, so a runner deleted mid-session is re-written on the next call
  * instead of handing back a path to a missing file (issue #8140).
  *
  * @param dirName Cache subdirectory prefix under the OS temp dir (unique per language).
  * @param ext Runner file extension without the dot (e.g. `py`).
  * @param script Runner source, hashed to key the cached file per version.
+ * @param tempRoot Temporary root already selected by the caller's execution policy.
  */
-export async function stageRunnerScript(dirName: string, ext: string, script: string): Promise<string> {
-	const memoized = stagedPaths.get(dirName);
+export async function stageRunnerScript(
+	dirName: string,
+	ext: string,
+	script: string,
+	tempRoot = os.tmpdir(),
+): Promise<string> {
+	const key = path.join(tempRoot, dirName);
+	const memoized = stagedPaths.get(key);
 	if (memoized) {
 		if (isReusableStagedPath(memoized)) return memoized;
-		stagedPaths.delete(dirName);
+		stagedPaths.delete(key);
 	}
-	const dir = await resolveStagingDir(dirName);
+	const dir = await resolveStagingDir(dirName, tempRoot);
 	const hash = Bun.hash(script).toString(36);
 	const target = path.join(dir, `runner-${hash}.${ext}`);
 	if (!fs.existsSync(target)) {
 		await Bun.write(target, script);
 	}
-	stagedPaths.set(dirName, target);
+	stagedPaths.set(key, target);
 	return target;
 }
 
@@ -73,15 +80,15 @@ function isReusableStagedPath(target: string): boolean {
 	return fs.existsSync(target);
 }
 
-async function resolveStagingDir(dirName: string): Promise<string> {
+async function resolveStagingDir(dirName: string, tempRoot: string): Promise<string> {
 	const uid = process.getuid?.();
 	// No uid (Windows): the temp dir is already per-user, and O_NOFOLLOW is unavailable.
 	if (uid === undefined) {
-		const dir = path.join(os.tmpdir(), dirName);
+		const dir = path.join(tempRoot, dirName);
 		await fs.promises.mkdir(dir, { recursive: true });
 		return dir;
 	}
-	const dir = path.join(os.tmpdir(), `${dirName}-${uid}`);
+	const dir = path.join(tempRoot, `${dirName}-${uid}`);
 	try {
 		await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
 		assertOwnerPrivateDir(dir, "Runner staging directory");

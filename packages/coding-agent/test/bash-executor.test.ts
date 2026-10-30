@@ -631,6 +631,9 @@ exit 64
 		if (!zshPath) {
 			return;
 		}
+		// An empty home starts zsh/newuser's setup wizard on some systems,
+		// blocking startup before the command's prompt can be displayed.
+		fs.writeFileSync(path.join(tempDir, ".zshrc"), "");
 		cfgShellPath.set(Settings.instance, zshPath);
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: zshPath,

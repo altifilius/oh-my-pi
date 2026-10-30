@@ -216,6 +216,32 @@ function readySpec(value: unknown): DaemonReadySpec {
 	return { log, port, host, timeoutMs };
 }
 
+function processResourcesSpec(value: unknown): DaemonSpec["processResources"] {
+	if (value === undefined) return undefined;
+	const source = record(value, "spec.processResources");
+	const options = record(source.options, "spec.processResources.options");
+	const mode = stringValue(options.mode, "processResources.mode");
+	if (mode !== "auto" && mode !== "conservative" && mode !== "off") throw new Error("Invalid process resource mode");
+	return {
+		command: rawString(source.command, "processResources.command"),
+		options: {
+			mode,
+			projectTemp: booleanValue(options.projectTemp, "processResources.projectTemp"),
+			minAvailableMemoryBytes: numberValue(
+				options.minAvailableMemoryBytes,
+				"processResources.minAvailableMemoryBytes",
+			),
+			minAvailableMemoryRatio: numberValue(
+				options.minAvailableMemoryRatio,
+				"processResources.minAvailableMemoryRatio",
+			),
+			memoryStallPercent: numberValue(options.memoryStallPercent, "processResources.memoryStallPercent"),
+			admissionTimeoutMs: numberValue(options.admissionTimeoutMs, "processResources.admissionTimeoutMs"),
+			maxHeavyJobs: numberValue(options.maxHeavyJobs, "processResources.maxHeavyJobs"),
+		},
+	};
+}
+
 /** Decode and validate a daemon launch specification. */
 export function parseDaemonSpec(value: unknown): DaemonSpec {
 	const source = record(value, "daemon spec");
@@ -231,6 +257,7 @@ export function parseDaemonSpec(value: unknown): DaemonSpec {
 		restart: restartPolicy(source.restart),
 		persist: booleanValue(source.persist, "spec.persist") || detached,
 		detached,
+		processResources: processResourcesSpec(source.processResources),
 	};
 }
 

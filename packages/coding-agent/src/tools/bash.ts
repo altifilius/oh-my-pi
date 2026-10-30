@@ -22,6 +22,7 @@ import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
+import { prepareProcessResources } from "../exec/process-resources";
 import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem, UrlFsError } from "../internal-urls/url-filesystem";
@@ -67,6 +68,7 @@ import {
 import {
 	cfgBashAllowCompoundCommands,
 	cfgBashAutoBackgroundEnabled,
+	cfgProcessResources,
 	cfgBashAutoBackgroundThresholdMs,
 	cfgBashDirenv,
 	cfgBashDirenvLoadTimeoutMs,
@@ -937,6 +939,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				try {
 					const result = await executeBash(options.command, {
 						cwd: options.commandCwd,
+						projectCwd: this.session.cwd,
 						env: options.sessionEnv,
 						// A call that starts in the foreground runs in the session's
 						// persistent shell, like the direct path, so its variables,
@@ -962,6 +965,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							pids = probe;
 						},
 						onSessionShellBusy: () => notices.push(SESSION_SHELL_BUSY_NOTICE),
+						onResourceNotice: notice => notices.push(notice),
 					}).finally(() => {
 						pids = NO_PIDS;
 						outputTap.close();
@@ -1342,201 +1346,130 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// `callerTimeoutMs` clamps the direnv load to a positive command timeout
 		// (the backend's own timeout is installed only after this await), matching
 		// the executeBash branch so a cold `.envrc` can't outlast a short call.
-		const backendPreflight =
-			bridgeTerminalAvailable || canUseInteractiveBashPty(pty === true, ctx)
-				? await applyDirenvPreflight(command, commandCwd, {
-						callerEnv: sessionEnv,
-						signal,
-						timeoutMs: cfgBashDirenvLoadTimeoutMs.get(this.session.settings),
-						callerTimeoutMs: timeoutMs,
-						direnvSetting: cfgBashDirenv.get(this.session.settings),
-					})
-				: undefined;
+		// ACP may launch on another machine: local pressure and paths do not apply.
+		const backendResources = canUseInteractiveBashPty(pty === true, ctx)
+			? await prepareProcessResources({
+					cwd: this.session.cwd,
+					owner: sessionId ?? this.session.cwd,
+					command,
+					env: sessionEnv,
+					signal,
+					options: cfgProcessResources.get(this.session.settings),
+				})
+			: undefined;
+		if (backendResources) pendingNotices.push(...backendResources.notices);
+		try {
+			const backendPreflight =
+				bridgeTerminalAvailable || canUseInteractiveBashPty(pty === true, ctx)
+					? await applyDirenvPreflight(backendResources?.command ?? command, commandCwd, {
+							callerEnv: backendResources?.env ?? sessionEnv,
+							signal,
+							timeoutMs: cfgBashDirenvLoadTimeoutMs.get(this.session.settings),
+							callerTimeoutMs: timeoutMs,
+							direnvSetting: cfgBashDirenv.get(this.session.settings),
+						})
+					: undefined;
 
-		// Route through the client terminal when the client advertises the terminal capability.
-		// Skip when pty=true (PTY needs the local terminal UI) or the cwd is a URL
-		// (only the embedded shell's filesystem can enter it).
-		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && virtualCwd === undefined) {
-			// Invariant (ACP terminal bridge): createTerminal has no signal in its
-			// contract; allocation cannot be cancelled retroactively. Guard before
-			// allocation. Shared timeout helper / pure AbortSignal fusion rejected:
-			// we need explicit kill-before-read ordering and distinct abort vs
-			// timeout result shapes. Per-route race retained for testability.
-			if (signal?.aborted) {
-				throw new ToolAbortError("Command aborted");
-			}
-
-			const bridgeWallTimeStart = performance.now();
-			const bridgeGraphics = new TerminalSnapshotDecoder();
-			const killGraceMs = 1000;
-			const outputSnapshotGraceMs = 2000;
-			// Cancellable timeout: a bare Bun.sleep(timeoutMs) would leave a live,
-			// ref'd timer for the full command timeout after fast completions —
-			// accumulating timers and delaying process shutdown in SDK/headless use.
-			// `timeoutMs` is optional (#4642): without one, no timer is armed and
-			// the promise simply never resolves.
-			const { promise: timeoutPromise, resolve: resolveTimeout } = Promise.withResolvers<{
-				kind: "timeout";
-			}>();
-			const timeoutTimer = timeoutMs ? setTimeout(() => resolveTimeout({ kind: "timeout" }), timeoutMs) : undefined;
-			const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
-			let handle: ClientBridgeTerminalHandle | undefined;
-			let killStarted = false;
-			const fireKill = (): Promise<void> => {
-				if (killStarted) return Promise.resolve();
-				const currentHandle = handle;
-				if (!currentHandle) return Promise.resolve();
-				killStarted = true;
-				return currentHandle.kill().catch((error: unknown) => {
-					logger.warn("ACP terminal kill failed", { terminalId: currentHandle.terminalId, error });
-				});
-			};
-			const cleanupLateCreate = (createP: Promise<ClientBridgeTerminalHandle>): void => {
-				void createP
-					.then(async lateHandle => {
-						try {
-							await lateHandle.kill();
-						} catch (error) {
-							logger.warn("ACP terminal kill failed", { terminalId: lateHandle.terminalId, error });
-						}
-						try {
-							await lateHandle.release();
-						} catch (error) {
-							logger.warn("ACP terminal release failed", { terminalId: lateHandle.terminalId, error });
-						}
-					})
-					.catch((error: unknown) => {
-						logger.warn("ACP terminal create failed after cancellation", { error });
-					});
-			};
-			const onAbortSignal = () => {
-				resolveAborted();
-				void fireKill();
-			};
-			signal?.addEventListener("abort", onAbortSignal, { once: true });
-
-			try {
-				// direnv-transformed command (carries any `unset -v` prefix) + direnv
-				// env; falls back to the raw command when direnv is off/absent.
-				const bridgeCommand = backendPreflight?.command ?? command;
-				const bridgeEnv = backendPreflight?.env;
-				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
-				const createP = clientBridge.createTerminal({
-					command: shellSpawn.command,
-					args: shellSpawn.args,
-					cwd: commandCwd,
-					env: bridgeEnv
-						? Object.entries(bridgeEnv).map(([name, value]) => ({ name, value: value as string }))
-						: undefined,
-					outputByteLimit: DEFAULT_MAX_BYTES,
-				});
-				const createRaced = await Promise.race([
-					createP.then(createdHandle => ({ kind: "created" as const, handle: createdHandle })),
-					timeoutPromise,
-					abortedP.then(() => ({ kind: "aborted" as const })),
-				]);
-				if (createRaced.kind === "aborted" || signal?.aborted) {
-					cleanupLateCreate(createP);
+			// Route through the client terminal when the client advertises the terminal capability.
+			// Skip when pty=true (PTY needs the local terminal UI) or the cwd is a URL
+			// (only the embedded shell's filesystem can enter it).
+			if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && virtualCwd === undefined) {
+				// Invariant (ACP terminal bridge): createTerminal has no signal in its
+				// contract; allocation cannot be cancelled retroactively. Guard before
+				// allocation. Shared timeout helper / pure AbortSignal fusion rejected:
+				// we need explicit kill-before-read ordering and distinct abort vs
+				// timeout result shapes. Per-route race retained for testability.
+				if (signal?.aborted) {
 					throw new ToolAbortError("Command aborted");
 				}
-				if (createRaced.kind === "timeout") {
-					cleanupLateCreate(createP);
-					const timedOutResult: BashInteractiveResult = {
-						output: "",
-						exitCode: undefined,
-						cancelled: false,
-						timedOut: true,
-						truncated: false,
-						totalLines: 0,
-						totalBytes: 0,
-						outputLines: 0,
-						outputBytes: 0,
-					};
-					return this.#buildCompletedResult(timedOutResult, timeoutSec, {
-						command,
-						cwd: commandCwd,
-						requestedTimeoutSec,
-						notices: pendingNotices,
-						wallTimeMs: performance.now() - bridgeWallTimeStart,
+
+				const bridgeWallTimeStart = performance.now();
+				const bridgeGraphics = new TerminalSnapshotDecoder();
+				const killGraceMs = 1000;
+				const outputSnapshotGraceMs = 2000;
+				// Cancellable timeout: a bare Bun.sleep(timeoutMs) would leave a live,
+				// ref'd timer for the full command timeout after fast completions —
+				// accumulating timers and delaying process shutdown in SDK/headless use.
+				// `timeoutMs` is optional (#4642): without one, no timer is armed and
+				// the promise simply never resolves.
+				const { promise: timeoutPromise, resolve: resolveTimeout } = Promise.withResolvers<{
+					kind: "timeout";
+				}>();
+				const timeoutTimer = timeoutMs
+					? setTimeout(() => resolveTimeout({ kind: "timeout" }), timeoutMs)
+					: undefined;
+				const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
+				let handle: ClientBridgeTerminalHandle | undefined;
+				let killStarted = false;
+				const fireKill = (): Promise<void> => {
+					if (killStarted) return Promise.resolve();
+					const currentHandle = handle;
+					if (!currentHandle) return Promise.resolve();
+					killStarted = true;
+					return currentHandle.kill().catch((error: unknown) => {
+						logger.warn("ACP terminal kill failed", { terminalId: currentHandle.terminalId, error });
 					});
-				}
-
-				handle = createRaced.handle;
-
-				// Emit partial update so the editor can embed the live terminal card.
-				onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
-
-				// Exit, timeout, and abort are each subscribed once and latch the first
-				// outcome. Every wait below races only a fresh per-iteration promise, so
-				// a long command does not pile reactions onto promises that stay pending.
-				type BridgeOutcome =
-					| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
-					| { kind: "timeout" }
-					| { kind: "aborted" }
-					| { kind: "failed"; error: unknown };
-				// Held on an object: TypeScript would narrow a closure-assigned `let` to `undefined`.
-				const bridge: { outcome?: BridgeOutcome; wake?: () => void } = {};
-				const settle = (next: BridgeOutcome): void => {
-					bridge.outcome ??= next;
-					bridge.wake?.();
 				};
-				void handle.waitForExit().then(
-					status => settle({ kind: "exit", status }),
-					(error: unknown) => settle({ kind: "failed", error }),
-				);
-				void timeoutPromise.then(settle);
-				void abortedP.then(() => settle({ kind: "aborted" }));
-				let exitStatus!: ClientBridgeTerminalExitStatus;
-				let lastPolledOutput: ClientBridgeTerminalOutput = { output: "", truncated: false };
+				const cleanupLateCreate = (createP: Promise<ClientBridgeTerminalHandle>): void => {
+					void createP
+						.then(async lateHandle => {
+							try {
+								await lateHandle.kill();
+							} catch (error) {
+								logger.warn("ACP terminal kill failed", { terminalId: lateHandle.terminalId, error });
+							}
+							try {
+								await lateHandle.release();
+							} catch (error) {
+								logger.warn("ACP terminal release failed", { terminalId: lateHandle.terminalId, error });
+							}
+						})
+						.catch((error: unknown) => {
+							logger.warn("ACP terminal create failed after cancellation", { error });
+						});
+				};
+				const onAbortSignal = () => {
+					resolveAborted();
+					void fireKill();
+				};
+				signal?.addEventListener("abort", onAbortSignal, { once: true });
 
-				// Poll until the process exits, times out, or the caller aborts.
-				for (;;) {
-					if (!bridge.outcome) {
-						// The sleep settles within one tick even when an outcome wakes us first.
-						const tick = Promise.withResolvers<void>();
-						bridge.wake = tick.resolve;
-						void Bun.sleep(250).then(tick.resolve);
-						await tick.promise;
-					}
-					const outcome = bridge.outcome;
-
-					if (outcome?.kind === "failed") throw outcome.error;
-
-					if (outcome?.kind === "aborted" || signal?.aborted) {
-						await Promise.race([fireKill(), Bun.sleep(killGraceMs)]);
+				try {
+					// direnv-transformed command (carries any `unset -v` prefix) + direnv
+					// env; falls back to the raw command when direnv is off/absent.
+					const bridgeCommand = backendPreflight?.command ?? command;
+					const bridgeEnv = backendPreflight?.env;
+					const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
+					const createP = clientBridge.createTerminal({
+						command: shellSpawn.command,
+						args: shellSpawn.args,
+						cwd: commandCwd,
+						env: bridgeEnv
+							? Object.entries(bridgeEnv).map(([name, value]) => ({ name, value: value as string }))
+							: undefined,
+						outputByteLimit: DEFAULT_MAX_BYTES,
+					});
+					const createRaced = await Promise.race([
+						createP.then(createdHandle => ({ kind: "created" as const, handle: createdHandle })),
+						timeoutPromise,
+						abortedP.then(() => ({ kind: "aborted" as const })),
+					]);
+					if (createRaced.kind === "aborted" || signal?.aborted) {
+						cleanupLateCreate(createP);
 						throw new ToolAbortError("Command aborted");
 					}
-
-					if (outcome?.kind === "timeout") {
-						// Kill before reading final output so a slow `terminal/output`
-						// RPC cannot let a timed-out command keep running past the
-						// enforced timeout. The handle stays valid post-kill so the
-						// buffered output is still readable.
-						await Promise.race([fireKill(), Bun.sleep(killGraceMs)]);
-						let current = lastPolledOutput;
-						try {
-							current = await Promise.race([
-								handle.currentOutput(),
-								Bun.sleep(outputSnapshotGraceMs).then(() => lastPolledOutput),
-							]);
-						} catch (error) {
-							logger.warn("ACP terminal final output read failed", {
-								terminalId: handle.terminalId,
-								error,
-							});
-						}
-						const decoded = await bridgeGraphics.finish(current.output);
+					if (createRaced.kind === "timeout") {
+						cleanupLateCreate(createP);
 						const timedOutResult: BashInteractiveResult = {
-							output: decoded.text,
+							output: "",
 							exitCode: undefined,
 							cancelled: false,
 							timedOut: true,
-							truncated: current.truncated,
-							totalLines: decoded.text.length > 0 ? decoded.text.split("\n").length : 0,
-							totalBytes: decoded.text.length,
-							outputLines: decoded.text.length > 0 ? decoded.text.split("\n").length : 0,
-							outputBytes: decoded.text.length,
-							...(decoded.images.length > 0 ? { images: decoded.images } : {}),
+							truncated: false,
+							totalLines: 0,
+							totalBytes: 0,
+							outputLines: 0,
+							outputBytes: 0,
 						};
 						return this.#buildCompletedResult(timedOutResult, timeoutSec, {
 							command,
@@ -1547,182 +1480,273 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						});
 					}
 
-					if (outcome?.kind === "exit") {
-						exitStatus = outcome.status;
-						break;
-					}
+					handle = createRaced.handle;
 
-					// Poll tick: push current output so agent-loop transcript stays consistent.
-					// Race the read against the outcomes so a stuck `terminal/output` RPC does
-					// not delay cancellation or let the command outlive its deadline.
-					const interrupted = Promise.withResolvers<undefined>();
-					bridge.wake = () => interrupted.resolve(undefined);
-					const pollOutput = await Promise.race([handle.currentOutput(), interrupted.promise]);
-					if (pollOutput === undefined) {
-						// An outcome landed during the poll-tick read; let the next loop
-						// iteration exit via the matching branch.
-						continue;
-					}
-					lastPolledOutput = pollOutput;
-					onUpdate?.({
-						content: [{ type: "text", text: bridgeGraphics.push(pollOutput.output) }],
-						details: { terminalId: handle.terminalId },
-					});
-				}
+					// Emit partial update so the editor can embed the live terminal card.
+					onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
 
-				// Fetch final output; the terminal is released in the outer finally.
-				let finalOutput = lastPolledOutput;
-				try {
-					finalOutput = await Promise.race([
-						handle.currentOutput(),
-						Bun.sleep(outputSnapshotGraceMs).then(() => lastPolledOutput),
-					]);
-				} catch (error) {
-					logger.warn("ACP terminal final output read failed", {
-						terminalId: handle.terminalId,
-						error,
-					});
-				}
+					// Exit, timeout, and abort are each subscribed once and latch the first
+					// outcome. Every wait below races only a fresh per-iteration promise, so
+					// a long command does not pile reactions onto promises that stay pending.
+					type BridgeOutcome =
+						| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
+						| { kind: "timeout" }
+						| { kind: "aborted" }
+						| { kind: "failed"; error: unknown };
+					// Held on an object: TypeScript would narrow a closure-assigned `let` to `undefined`.
+					const bridge: { outcome?: BridgeOutcome; wake?: () => void } = {};
+					const settle = (next: BridgeOutcome): void => {
+						bridge.outcome ??= next;
+						bridge.wake?.();
+					};
+					void handle.waitForExit().then(
+						status => settle({ kind: "exit", status }),
+						(error: unknown) => settle({ kind: "failed", error }),
+					);
+					void timeoutPromise.then(settle);
+					void abortedP.then(() => settle({ kind: "aborted" }));
+					let exitStatus!: ClientBridgeTerminalExitStatus;
+					let lastPolledOutput: ClientBridgeTerminalOutput = { output: "", truncated: false };
 
-				// Map exit status: null exitCode with a signal → treat as signal kill (137).
-				const rawExitCode = exitStatus.exitCode;
-				const exitCode: number | undefined =
-					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
+					// Poll until the process exits, times out, or the caller aborts.
+					for (;;) {
+						if (!bridge.outcome) {
+							// The sleep settles within one tick even when an outcome wakes us first.
+							const tick = Promise.withResolvers<void>();
+							bridge.wake = tick.resolve;
+							void Bun.sleep(250).then(tick.resolve);
+							await tick.promise;
+						}
+						const outcome = bridge.outcome;
 
-				const decoded = await bridgeGraphics.finish(finalOutput.output);
-				const outputText = decoded.text;
-				const outputByteLen = outputText.length;
-				const outputLineCount = outputText.length > 0 ? outputText.split("\n").length : 0;
+						if (outcome?.kind === "failed") throw outcome.error;
 
-				const bridgeResult: BashResult = {
-					output: outputText,
-					exitCode,
-					cancelled: false,
-					truncated: finalOutput.truncated,
-					totalLines: outputLineCount,
-					totalBytes: outputByteLen,
-					outputLines: outputLineCount,
-					outputBytes: outputByteLen,
-					...(decoded.images.length > 0 ? { images: decoded.images } : {}),
-				};
+						if (outcome?.kind === "aborted" || signal?.aborted) {
+							await Promise.race([fireKill(), Bun.sleep(killGraceMs)]);
+							throw new ToolAbortError("Command aborted");
+						}
 
-				const bridgeNotices: string[] = [];
-				if (finalOutput.truncated) bridgeNotices.push("(output truncated)");
-				for (const notice of pendingNotices) bridgeNotices.push(notice);
-
-				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
-					command,
-					cwd: commandCwd,
-					requestedTimeoutSec,
-					notices: bridgeNotices,
-					wallTimeMs: performance.now() - bridgeWallTimeStart,
-				});
-			} finally {
-				clearTimeout(timeoutTimer);
-				signal?.removeEventListener("abort", onAbortSignal);
-				if (handle) {
-					const releaseHandle = handle;
-					// Bound release like kill/output: a hung `terminal/release` RPC must not
-					// keep the tool pending after the result is already decided.
-					await Promise.race([
-						releaseHandle.release().catch((error: unknown) => {
-							logger.warn("ACP terminal release failed", { terminalId: releaseHandle.terminalId, error });
-						}),
-						Bun.sleep(killGraceMs),
-					]);
-				}
-			}
-		}
-
-		// Allocate artifact for truncated output storage
-		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
-
-		const interactiveUi = canUseInteractiveBashPty(pty === true, ctx) ? ctx?.ui : undefined;
-		if (pty && !interactiveUi) {
-			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
-		}
-		const wallTimeStart = performance.now();
-		// Each frame of the card repeats the latest preview with the replies so far; the transcript draws the new ones.
-		const replies: string[] = [];
-		let preview = "";
-		const emitFrame = onUpdate
-			? () =>
-					onUpdate({
-						content: [{ type: "text", text: preview }],
-						details: replies.length > 0 ? { replies: [...replies] } : {},
-					})
-			: undefined;
-		const result: BashResult | BashInteractiveResult = interactiveUi
-			? await runInteractiveBashPty(interactiveUi, {
-					// PTY bypasses executeBash, so feed it the direnv-transformed
-					// command + direnv env (backendPreflight is defined whenever this
-					// branch runs, since both gate on canUseInteractiveBashPty).
-					command: backendPreflight?.command ?? command,
-					cwd: commandCwd,
-					timeoutMs,
-					signal,
-					env: backendPreflight?.env,
-					artifactPath,
-					artifactId,
-				})
-			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command here so the unset prefix is not applied twice.
-				await executeBash(command, {
-					cwd: commandCwd,
-					env: sessionEnv,
-					sessionKey: sessionId,
-					isSessionCurrent: () => (this.session.getSessionId?.() ?? undefined) === sessionId,
-					timeout: timeoutMs ?? 0,
-					signal,
-					gitGuard: cfgBashGitGuard.get(this.session.settings),
-					filesystem: this.#urlFilesystem(signal, approvalTier, text => {
-						replies.push(text);
-						emitFrame?.();
-					}).shellFilesystem(),
-					artifactPath,
-					artifactId,
-					// Stream the sink's own inline view rather than re-buffering chunks.
-					onPreview: emitFrame
-						? text => {
-								preview = text;
-								emitFrame();
+						if (outcome?.kind === "timeout") {
+							// Kill before reading final output so a slow `terminal/output`
+							// RPC cannot let a timed-out command keep running past the
+							// enforced timeout. The handle stays valid post-kill so the
+							// buffered output is still readable.
+							await Promise.race([fireKill(), Bun.sleep(killGraceMs)]);
+							let current = lastPolledOutput;
+							try {
+								current = await Promise.race([
+									handle.currentOutput(),
+									Bun.sleep(outputSnapshotGraceMs).then(() => lastPolledOutput),
+								]);
+							} catch (error) {
+								logger.warn("ACP terminal final output read failed", {
+									terminalId: handle.terminalId,
+									error,
+								});
 							}
-						: undefined,
-					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
-					onSessionShellBusy: () => pendingNotices.push(SESSION_SHELL_BUSY_NOTICE),
-				});
-		const wallTimeMs = performance.now() - wallTimeStart;
-		if (result.cancelled) {
-			// A cancelled result is either a timeout (the command's deadline fired)
-			// or a user/system abort. Timeouts are handled by #buildCompletedResult
-			// which returns a non-throwing error result with details.timedOut=true
-			// so the renderer can show a warning border instead of error red.
-			// Both interactive and non-interactive results carry an explicit
-			// `timedOut` field from the executor/PTY layer.
-			const isTimeout = result.timedOut === true;
-			if (!isTimeout) {
-				const out = normalizeResultOutput(result);
-				// The local executor already prepends `[Command cancelled]`; PTY
-				// output does not, so preserve one cancellation notice in either case.
-				let message = out.startsWith("[Command cancelled]")
-					? out
-					: out
-						? `${out}\n\n[Command aborted]`
-						: "Command aborted";
-				if (result.artifactError) message += `\n\n[${formatArtifactErrorNotice(result.artifactError)}]`;
-				if (signal?.aborted) {
-					throw new ToolAbortError(message);
+							const decoded = await bridgeGraphics.finish(current.output);
+							const timedOutResult: BashInteractiveResult = {
+								output: decoded.text,
+								exitCode: undefined,
+								cancelled: false,
+								timedOut: true,
+								truncated: current.truncated,
+								totalLines: decoded.text.length > 0 ? decoded.text.split("\n").length : 0,
+								totalBytes: decoded.text.length,
+								outputLines: decoded.text.length > 0 ? decoded.text.split("\n").length : 0,
+								outputBytes: decoded.text.length,
+								...(decoded.images.length > 0 ? { images: decoded.images } : {}),
+							};
+							return this.#buildCompletedResult(timedOutResult, timeoutSec, {
+								command,
+								cwd: commandCwd,
+								requestedTimeoutSec,
+								notices: pendingNotices,
+								wallTimeMs: performance.now() - bridgeWallTimeStart,
+							});
+						}
+
+						if (outcome?.kind === "exit") {
+							exitStatus = outcome.status;
+							break;
+						}
+
+						// Poll tick: push current output so agent-loop transcript stays consistent.
+						// Race the read against the outcomes so a stuck `terminal/output` RPC does
+						// not delay cancellation or let the command outlive its deadline.
+						const interrupted = Promise.withResolvers<undefined>();
+						bridge.wake = () => interrupted.resolve(undefined);
+						const pollOutput = await Promise.race([handle.currentOutput(), interrupted.promise]);
+						if (pollOutput === undefined) {
+							// An outcome landed during the poll-tick read; let the next loop
+							// iteration exit via the matching branch.
+							continue;
+						}
+						lastPolledOutput = pollOutput;
+						onUpdate?.({
+							content: [{ type: "text", text: bridgeGraphics.push(pollOutput.output) }],
+							details: { terminalId: handle.terminalId },
+						});
+					}
+
+					// Fetch final output; the terminal is released in the outer finally.
+					let finalOutput = lastPolledOutput;
+					try {
+						finalOutput = await Promise.race([
+							handle.currentOutput(),
+							Bun.sleep(outputSnapshotGraceMs).then(() => lastPolledOutput),
+						]);
+					} catch (error) {
+						logger.warn("ACP terminal final output read failed", {
+							terminalId: handle.terminalId,
+							error,
+						});
+					}
+
+					// Map exit status: null exitCode with a signal → treat as signal kill (137).
+					const rawExitCode = exitStatus.exitCode;
+					const exitCode: number | undefined =
+						rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
+
+					const decoded = await bridgeGraphics.finish(finalOutput.output);
+					const outputText = decoded.text;
+					const outputByteLen = outputText.length;
+					const outputLineCount = outputText.length > 0 ? outputText.split("\n").length : 0;
+
+					const bridgeResult: BashResult = {
+						output: outputText,
+						exitCode,
+						cancelled: false,
+						truncated: finalOutput.truncated,
+						totalLines: outputLineCount,
+						totalBytes: outputByteLen,
+						outputLines: outputLineCount,
+						outputBytes: outputByteLen,
+						...(decoded.images.length > 0 ? { images: decoded.images } : {}),
+					};
+
+					const bridgeNotices: string[] = [];
+					if (finalOutput.truncated) bridgeNotices.push("(output truncated)");
+					for (const notice of pendingNotices) bridgeNotices.push(notice);
+
+					return this.#buildCompletedResult(bridgeResult, timeoutSec, {
+						command,
+						cwd: commandCwd,
+						requestedTimeoutSec,
+						notices: bridgeNotices,
+						wallTimeMs: performance.now() - bridgeWallTimeStart,
+					});
+				} finally {
+					clearTimeout(timeoutTimer);
+					signal?.removeEventListener("abort", onAbortSignal);
+					if (handle) {
+						const releaseHandle = handle;
+						// Bound release like kill/output: a hung `terminal/release` RPC must not
+						// keep the tool pending after the result is already decided.
+						await Promise.race([
+							releaseHandle.release().catch((error: unknown) => {
+								logger.warn("ACP terminal release failed", { terminalId: releaseHandle.terminalId, error });
+							}),
+							Bun.sleep(killGraceMs),
+						]);
+					}
 				}
-				throw new ToolError(message);
 			}
+
+			// Allocate artifact for truncated output storage
+			const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+
+			const interactiveUi = canUseInteractiveBashPty(pty === true, ctx) ? ctx?.ui : undefined;
+			if (pty && !interactiveUi) {
+				pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
+			}
+			const wallTimeStart = performance.now();
+			// Each frame of the card repeats the latest preview with the replies so far; the transcript draws the new ones.
+			const replies: string[] = [];
+			let preview = "";
+			const emitFrame = onUpdate
+				? () =>
+						onUpdate({
+							content: [{ type: "text", text: preview }],
+							details: replies.length > 0 ? { replies: [...replies] } : {},
+						})
+				: undefined;
+			const result: BashResult | BashInteractiveResult = interactiveUi
+				? await runInteractiveBashPty(interactiveUi, {
+						// PTY bypasses executeBash, so feed it the direnv-transformed
+						// command + direnv env (backendPreflight is defined whenever this
+						// branch runs, since both gate on canUseInteractiveBashPty).
+						command: backendPreflight?.command ?? command,
+						cwd: commandCwd,
+						timeoutMs,
+						signal,
+						env: backendPreflight?.env,
+						artifactPath,
+						artifactId,
+					})
+				: // executeBash runs its OWN direnv preflight internally — pass the RAW
+					// command here so the unset prefix is not applied twice.
+					await executeBash(command, {
+						cwd: commandCwd,
+						projectCwd: this.session.cwd,
+						env: sessionEnv,
+						sessionKey: sessionId,
+						isSessionCurrent: () => (this.session.getSessionId?.() ?? undefined) === sessionId,
+						timeout: timeoutMs ?? 0,
+						signal,
+						gitGuard: cfgBashGitGuard.get(this.session.settings),
+						filesystem: this.#urlFilesystem(signal, approvalTier, text => {
+							replies.push(text);
+							emitFrame?.();
+						}).shellFilesystem(),
+						artifactPath,
+						artifactId,
+						// Stream the sink's own inline view rather than re-buffering chunks.
+						onPreview: emitFrame
+							? text => {
+									preview = text;
+									emitFrame();
+								}
+							: undefined,
+						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+						onSessionShellBusy: () => pendingNotices.push(SESSION_SHELL_BUSY_NOTICE),
+						onResourceNotice: notice => pendingNotices.push(notice),
+					});
+			const wallTimeMs = performance.now() - wallTimeStart;
+			if (result.cancelled) {
+				// A cancelled result is either a timeout (the command's deadline fired)
+				// or a user/system abort. Timeouts are handled by #buildCompletedResult
+				// which returns a non-throwing error result with details.timedOut=true
+				// so the renderer can show a warning border instead of error red.
+				// Both interactive and non-interactive results carry an explicit
+				// `timedOut` field from the executor/PTY layer.
+				const isTimeout = result.timedOut === true;
+				if (!isTimeout) {
+					const out = normalizeResultOutput(result);
+					// The local executor already prepends `[Command cancelled]`; PTY
+					// output does not, so preserve one cancellation notice in either case.
+					let message = out.startsWith("[Command cancelled]")
+						? out
+						: out
+							? `${out}\n\n[Command aborted]`
+							: "Command aborted";
+					if (result.artifactError) message += `\n\n[${formatArtifactErrorNotice(result.artifactError)}]`;
+					if (signal?.aborted) {
+						throw new ToolAbortError(message);
+					}
+					throw new ToolError(message);
+				}
+			}
+			return this.#buildCompletedResult(result, timeoutSec, {
+				command,
+				cwd: commandCwd,
+				requestedTimeoutSec,
+				notices: pendingNotices,
+				wallTimeMs,
+				replies,
+			});
+		} finally {
+			await backendResources?.release();
 		}
-		return this.#buildCompletedResult(result, timeoutSec, {
-			command,
-			cwd: commandCwd,
-			requestedTimeoutSec,
-			notices: pendingNotices,
-			wallTimeMs,
-			replies,
-		});
 	}
 }

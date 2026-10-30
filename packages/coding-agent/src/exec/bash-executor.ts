@@ -12,6 +12,7 @@ import {
 	type ShellFilesystem,
 	type ShellRunResult,
 } from "@oh-my-pi/pi-natives";
+import { logger } from "@oh-my-pi/pi-utils";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings } from "../config/settings";
@@ -26,10 +27,12 @@ import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
+import { prepareProcessResources, registerReleasedProcessResource } from "./process-resources";
 
 import {
 	cfgBashDirenv,
 	cfgBashDirenvLoadTimeoutMs,
+	cfgProcessResources,
 	cfgShellMinimizer,
 	cfgShellPath,
 	type ShellMinimizerSettings,
@@ -50,6 +53,10 @@ export interface BashExecutorOptions {
 	signal?: AbortSignal;
 	/** Session key suffix to isolate shell sessions per agent */
 	sessionKey?: string;
+	/** Canonical project anchor; command cwd may point into a build subdirectory. */
+	projectCwd?: string;
+	/** Resource diagnostics are metadata, never child stdout/stderr. */
+	onResourceNotice?: (notice: string) => void;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
 	/** Run through the configured user shell instead of brush parsing directly. */
@@ -103,6 +110,8 @@ export interface BashExecutorOptions {
 		originalText: string,
 		info: { filter: string; inputBytes: number; outputBytes: number },
 	) => Promise<string | undefined>;
+	/** Internal lifetime handoff: cancellation can return before native teardown finishes. */
+	onProcessSettled?: (settled: Promise<unknown>) => void;
 }
 
 /** Viewport + raw-output callback enabling the user-shell PTY path (`!` hotkey). */
@@ -265,6 +274,22 @@ async function retainShellWithLiveBackgroundJobs(shell: Shell): Promise<void> {
 	interval.unref?.();
 }
 
+async function releaseUnusedShell(owner: string, shell: Shell): Promise<void> {
+	if ((await shell.liveBackgroundJobCount()) > 0) {
+		await retainShellWithLiveBackgroundJobs(shell);
+		return;
+	}
+	// This shell was removed from the reusable map and its run already ended.
+	// Never target an active session, daemon, or a PID inferred from its name.
+	const unregister = registerReleasedProcessResource(owner, shell, () => shell.abort());
+	try {
+		await shell.abort();
+		unregister();
+	} catch {
+		// Keep only failed cleanup registered for the next owned heavy admission.
+	}
+}
+
 /**
  * A timer promise that resolves after {@link QUARANTINE_CLEANUP_TIMEOUT_MS}.
  * Used to bound quarantine cleanup; the timer is unref'd so it never keeps the
@@ -314,7 +339,7 @@ export function releaseShellSessions(agentSessionKey: string | undefined): void 
 	for (const [key, shell] of shellSessions) {
 		if (!key.startsWith(prefix)) continue;
 		shellSessions.delete(key);
-		if (!shellSessionsInUse.has(key)) void retainShellWithLiveBackgroundJobs(shell);
+		if (!shellSessionsInUse.has(key)) void releaseUnusedShell(agentSessionKey, shell).catch(() => undefined);
 	}
 }
 
@@ -554,6 +579,42 @@ async function executeUserShellPty(run: {
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = await Settings.init();
+	const cwd = options?.projectCwd ?? options?.cwd ?? process.cwd();
+	if (URL_CWD_RE.test(cwd) || options?.signal?.aborted) return executeBashCommand(command, options);
+	const resources = await prepareProcessResources({
+		cwd,
+		owner: options?.sessionKey ?? cwd,
+		command,
+		env: options?.env,
+		signal: options?.signal,
+		options: cfgProcessResources.get(settings),
+	});
+	let settled: Promise<unknown> | undefined;
+	try {
+		for (const notice of resources.notices) {
+			if (options?.onResourceNotice) options.onResourceNotice(notice);
+			else logger.warn(notice);
+		}
+		const result = await executeBashCommand(resources.command, {
+			...options,
+			env: resources.env,
+			onProcessSettled: promise => {
+				settled = promise;
+				options?.onProcessSettled?.(promise);
+			},
+		});
+		return result;
+	} finally {
+		if (settled) {
+			// Native cancellation can outlive the returned result. Keep admission
+			// occupied until actual teardown, without making cancellation hang.
+			void settled.finally(() => resources.release()).catch(() => undefined);
+		} else await resources.release();
+	}
+}
+
+async function executeBashCommand(command: string, options?: BashExecutorOptions): Promise<BashResult> {
+	const settings = await Settings.init();
 	const baseShellConfig = settings.getShellConfig();
 	const shellConfig =
 		options?.useUserShell === true ? resolveUserShellConfig(settings, baseShellConfig) : baseShellConfig;
@@ -772,6 +833,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			},
 		);
 		options?.onStart?.(() => executionShell.pids());
+		options?.onProcessSettled?.(
+			runPromise.then(
+				() => undefined,
+				() => undefined,
+			),
+		);
 
 		const winner = await Promise.race<
 			{ kind: "result"; result: ShellRunResult } | { kind: "timeout" } | { kind: "abort" }
@@ -902,7 +969,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				// turns; it is reaped once its last job exits and still dies with the
 				// harness. Skip on resetSession (cancel/error) — those tear down.
 				if (!resetSession && shellSession) {
-					await retainShellWithLiveBackgroundJobs(shellSession);
+					await releaseUnusedShell(options?.sessionKey ?? options?.cwd ?? process.cwd(), shellSession);
 				}
 			}
 		}

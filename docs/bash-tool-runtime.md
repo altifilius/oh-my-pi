@@ -18,6 +18,63 @@ Both eventually use `executeBash()` in `src/exec/bash-executor.ts` for non-PTY e
 
 Set `bash.enabled: false` in settings to remove the model-facing `bash` tool from the active tool registry. This does not disable user-initiated bang commands or RPC `bash` requests.
 
+## Automatic local process resource policy
+
+`processResources.mode` defaults to `auto`. Before local Bash execution, OMP puts child temporary
+files under the nearest project/worktree root's `build/tests/omp/<owner-hash>/tmp` and supplies
+`TMPDIR`, `TMP`, `TEMP`, and `OMP_WORK_DIR`. This applies to the embedded shell, local PTY,
+managed services, and isolated Python/JavaScript eval processes. Subdirectories share their nearest
+project anchor; separate worktrees remain separate. The resource anchor resolves the caller's
+symlinks without changing the shell's logical `PWD`. Managed descendants reject symlinks and
+shared private leaves; OMP does not chmod user directories. Linux refuses a tmpfs/ramfs project
+temporary filesystem instead of silently falling back to `/tmp`. User code that explicitly opens
+`/tmp` is not rewritten. Python eval also stages its interpreter runner inside the selected project
+temporary root, with cache keys isolated by root. ACP client terminals are excluded: the bridge
+does not establish that its filesystem or process runs on the local host.
+
+Before a recognized heavy build/test, OMP reaps only lifecycle-released resources registered by
+that owner. Active jobs, named services, retained eval variables, other sessions' resources,
+and arbitrary PIDs are never killed based on a name, age, or memory usage. Normal session disposal
+remains responsible for active-resource teardown.
+
+On Linux, admission reads `MemAvailable`, memory PSI, and v1/v2 memory limits along the current
+cgroup ancestry without spawning diagnostic commands. Other systems use available OS memory;
+missing Linux telemetry selects conservative scheduling. Healthy cooperating processes admit at
+most two heavy jobs per project; constrained memory or `conservative` mode admits one. Critical
+memory pressure queues heavy work until recovery, cancellation, or the admission deadline.
+Lightweight diagnostics do not wait on this heavy-work gate. Existing extension admission,
+systemd/cgroup memory limits, swap configuration, and OOM protection are not changed or bypassed.
+
+Under constrained/conservative scheduling, understood literal build/test commands use one worker:
+Make/Ninja/CMake/Cargo/Go, CTest, pytest's existing xdist flags, Jest, Vitest, and Bun test.
+The existing shell tokenizer preserves quoting; dynamic expansions, redirects, heredocs, and
+opaque scripts are not rewritten. Those receive advisory parallel environment variables only.
+Environment hints include `CMAKE_BUILD_PARALLEL_LEVEL`, `CTEST_PARALLEL_LEVEL`, `CARGO_BUILD_JOBS`,
+`RUST_TEST_THREADS`, Make/Go flags and native numeric-worker limits. Explicit numeric Cargo libtest
+`--test-threads` options are reduced too; unknown operands and libtest's own `--` boundary are
+preserved. Resource diagnostics are separate from the executor's child stdout/stderr. Leases
+cover the actual command/service generation, including background execution, and use PID start
+identity to recover stale Linux owners.
+
+Settings are registered in `src/exec/settings.ts`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `processResources.mode` | `auto` | `conservative` always serializes heavy work; `off` disables this local policy, not host protection |
+| `processResources.projectTemp` | `true` | Manage project-backed child temporary directories |
+| `processResources.minAvailableMemoryBytes` | `536870912` | Absolute constrained-memory threshold |
+| `processResources.minAvailableMemoryRatio` | `0.2` | Relative constrained-memory threshold |
+| `processResources.memoryStallPercent` | `5` | Memory PSI threshold |
+| `processResources.admissionTimeoutMs` | `30000` | Cancellable heavy-admission wait bound |
+| `processResources.maxHeavyJobs` | `2` | Healthy per-project cooperating job ceiling (never more than two) |
+
+This is cooperative admission, not a hard memory/disk quota or a sandbox. A script can ignore
+worker hints or spawn detached descendants. Virtual/remote working directories are not mapped
+to a local temporary tree. Bun Worker fallback cannot isolate native process environment without
+changing the host: auto mode warns and preserves existing fallback behavior; conservative mode
+with project temp refuses that fallback. Eval cells preserve user state and are not parsed as shell
+commands. Persistent temporary data is retained; OMP does not recursively delete it on completion.
+
 ## End-to-end tool-call pipeline
 
 ## 1) Input handling and mode selection

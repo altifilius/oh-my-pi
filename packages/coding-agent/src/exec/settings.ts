@@ -288,3 +288,50 @@ export const cfgBashAutoBackgroundThresholdMs = register({
 	type: "number",
 	default: 60_000,
 });
+
+/** Local process admission never changes host cgroup, swap, or OOM policy. */
+export const cfgProcessResourcesMode = register({
+	id: "processResources.mode",
+	type: "enum",
+	values: ["auto", "conservative", "off"] as const,
+	default: "auto",
+});
+export const cfgProcessResourcesProjectTemp = register({
+	id: "processResources.projectTemp",
+	type: "boolean",
+	default: true,
+});
+export const cfgProcessResourcesMinAvailableMemoryBytes = register({
+	id: "processResources.minAvailableMemoryBytes",
+	type: "number",
+	default: 512 * 1024 * 1024,
+});
+export const cfgProcessResourcesMinAvailableMemoryRatio = register({
+	id: "processResources.minAvailableMemoryRatio",
+	type: "number",
+	default: 0.2,
+});
+export const cfgProcessResourcesMemoryStallPercent = register({
+	id: "processResources.memoryStallPercent",
+	type: "number",
+	default: 5,
+});
+export const cfgProcessResourcesAdmissionTimeoutMs = register({
+	id: "processResources.admissionTimeoutMs",
+	type: "number",
+	default: 30_000,
+});
+export const cfgProcessResourcesMaxHeavyJobs = register({
+	id: "processResources.maxHeavyJobs",
+	type: "number",
+	default: 2,
+});
+export const cfgProcessResources = combine({
+	mode: cfgProcessResourcesMode,
+	projectTemp: cfgProcessResourcesProjectTemp,
+	minAvailableMemoryBytes: cfgProcessResourcesMinAvailableMemoryBytes,
+	minAvailableMemoryRatio: cfgProcessResourcesMinAvailableMemoryRatio,
+	memoryStallPercent: cfgProcessResourcesMemoryStallPercent,
+	admissionTimeoutMs: cfgProcessResourcesAdmissionTimeoutMs,
+	maxHeavyJobs: cfgProcessResourcesMaxHeavyJobs,
+});

@@ -264,6 +264,8 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 	requireRemainingTimeoutMs(options.deadlineMs);
 	return await PythonKernel.start({
 		cwd,
+		resourceOwner: options.sessionId ?? cwd,
+		resourceSettings: options.toolSession?.settings,
 		env: buildManagedKernelEnv(options),
 		signal: options.signal,
 		deadlineMs: options.deadlineMs,

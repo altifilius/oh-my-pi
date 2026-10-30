@@ -2590,6 +2590,28 @@ def _apply_request_runtime(req: dict) -> None:
             elif value is None:
                 os.environ.pop(key, None)
 
+    env = req.get("resourceEnv")
+    if isinstance(env, dict):
+        # Resource patches are explicit-only: unlike PI bridge keys, an absent
+        # key must preserve the retained kernel's user-managed environment.
+        for key in (
+            "TMPDIR", "TMP", "TEMP", "OMP_WORK_DIR", "MAKEFLAGS",
+            "CMAKE_BUILD_PARALLEL_LEVEL", "CARGO_BUILD_JOBS", "CTEST_PARALLEL_LEVEL",
+            "GOMAXPROCS", "GOFLAGS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "UV_THREADPOOL_SIZE",
+        ):
+            if key not in env:
+                continue
+            value = env[key]
+            if key == "TMPDIR" and value != os.environ.get(key):
+                tempfile_module = sys.modules.get("tempfile")
+                if tempfile_module is not None:
+                    tempfile_module.tempdir = None
+            if isinstance(value, str):
+                os.environ[key] = value
+            elif value is None:
+                os.environ.pop(key, None)
+
 
 def _start_parent_watchdog() -> None:
     """Self-terminate when the host process dies.

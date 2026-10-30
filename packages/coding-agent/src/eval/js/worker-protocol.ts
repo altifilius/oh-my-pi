@@ -10,6 +10,8 @@ export interface EvalPreludeSource {
 export interface SessionSnapshot {
 	cwd: string;
 	sessionId: string;
+	/** Native environment patch; only the dedicated process may apply it, never a shared-process Worker. */
+	processEnv?: Record<string, string | null>;
 	/**
 	 * On-disk roots the helpers substitute for internal-URL schemes
 	 * (e.g. `{ local: "/…/artifacts/local" }`). Lets `read`/`write`

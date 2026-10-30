@@ -5,6 +5,7 @@ node_modules
 # Build output
 dist/
 packages/*/dist/
+build/tests/omp/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
 target/
