@@ -5,6 +5,7 @@
 ### Added
 
 - Added queueable compaction: `/compact` sent with the follow-up key (Ctrl+Q) while the agent works now runs when it yields instead of interrupting it ([#17397](https://github.com/can1357/oh-my-pi/pull/17397) by [@H4vC](https://github.com/H4vC))
+- Added an opt-in Linux resource-queue extension example with cross-session FIFO admission, background-job settlement tracking, and diagnostic/cancellation access under resource pressure; core scheduling and host resource limits remain unchanged.
 
 ### Fixed
 

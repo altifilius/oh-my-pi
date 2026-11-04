@@ -22,6 +22,7 @@ cp permission-gate.ts ~/.omp/agent/extensions/
 | `protected-paths.ts`     | Blocks writes to protected paths (.env, .git/, node_modules/)                |
 | `confirm-destructive.ts` | Confirms before destructive session actions (clear, switch, branch)          |
 | `dirty-repo-guard.ts`    | Prevents session changes with uncommitted git changes                        |
+| [`resource-queue/`](resource-queue/README.md) | Linux FIFO admission across CLI process families; retains finite background jobs through settlement |
 
 ### Custom Tools
 
